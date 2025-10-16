@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+import argparse
+import sys
+import time
+from pathlib import Path
+
+# add src to path so we can import our modules
+sys.path.insert(0, str(Path(__file__).parent / "src"))
+
+import daemon_manager as dm
+
+
+# ##################################################################
+# command ps
+# lists all configured processes with their current status
+def command_ps(args: argparse.Namespace) -> int:
+    processes = dm.list_processes()
+    if not processes:
+        print("No processes configured")
+        return 0
+
+    for name, info in sorted(processes.items()):
+        pid = info["pid"]
+        status = str(pid) if pid is not None else "dead"
+        print(f"{name}: {status}")
+    return 0
+
+
+# ##################################################################
+# command start
+# starts a configured process by name
+def command_start(args: argparse.Namespace) -> int:
+    name = args.name
+    try:
+        pid = dm.start_process(name)
+        print(f"Started {name} with pid {pid}")
+        return 0
+    except Exception as err:
+        print(f"Error: {err}")
+        return 1
+
+
+# ##################################################################
+# command stop
+# stops a running process by name
+def command_stop(args: argparse.Namespace) -> int:
+    name = args.name
+    try:
+        dm.stop_process(name)
+        print(f"Stopped {name}")
+        return 0
+    except Exception as err:
+        print(f"Error: {err}")
+        return 1
+
+
+# ##################################################################
+# command restart
+# restarts a process by stopping and starting it
+def command_restart(args: argparse.Namespace) -> int:
+    name = args.name
+    try:
+        # stop if running
+        pid = dm.get_process_status(name)
+        if pid is not None:
+            dm.stop_process(name)
+            print(f"Stopped {name}")
+
+        # start
+        pid = dm.start_process(name)
+        print(f"Started {name} with pid {pid}")
+        return 0
+    except Exception as err:
+        print(f"Error: {err}")
+        return 1
+
+
+# ##################################################################
+# command add
+# adds a new process to config and starts it immediately
+def command_add(args: argparse.Namespace) -> int:
+    name = args.name
+    command = " ".join(args.command)
+    try:
+        dm.add_process(name, command)
+        print(f"Added {name}")
+        pid = dm.start_process(name)
+        print(f"Started {name} with pid {pid}")
+        return 0
+    except Exception as err:
+        print(f"Error: {err}")
+        return 1
+
+
+# ##################################################################
+# command remove
+# removes a process from config and stops it if running
+def command_remove(args: argparse.Namespace) -> int:
+    name = args.name
+    try:
+        dm.remove_process(name)
+        print(f"Removed {name}")
+        return 0
+    except Exception as err:
+        print(f"Error: {err}")
+        return 1
+
+
+# ##################################################################
+# command show
+# displays the command line for a configured process
+def command_show(args: argparse.Namespace) -> int:
+    name = args.name
+    try:
+        command = dm.get_process_command(name)
+        print(f"{name}: {command}")
+        return 0
+    except Exception as err:
+        print(f"Error: {err}")
+        return 1
+
+
+# ##################################################################
+# command start all
+# starts all configured processes that are not currently running
+def command_start_all(args: argparse.Namespace) -> int:
+    dm.start_all_processes()
+    print("Started all configured processes")
+    return 0
+
+
+# ##################################################################
+# command watch
+# continuously monitors and restarts dead processes with exponential backoff
+def command_watch(args: argparse.Namespace) -> int:
+    print("Watching processes for automatic restart...")
+    try:
+        while True:
+            dm.watch_and_restart_processes()
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nStopped watching")
+        return 0
+
+
+# ##################################################################
+# main
+# parses arguments and dispatches to the appropriate command handler
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="auto",
+        description="Manage daemon processes"
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # ps command
+    ps_parser = subparsers.add_parser("ps", help="List all processes with status")
+    ps_parser.set_defaults(func=command_ps)
+
+    # start command
+    start_parser = subparsers.add_parser("start", help="Start a process")
+    start_parser.add_argument("name", help="Process name")
+    start_parser.set_defaults(func=command_start)
+
+    # stop command
+    stop_parser = subparsers.add_parser("stop", help="Stop a process")
+    stop_parser.add_argument("name", help="Process name")
+    stop_parser.set_defaults(func=command_stop)
+
+    # restart command
+    restart_parser = subparsers.add_parser("restart", help="Restart a process")
+    restart_parser.add_argument("name", help="Process name")
+    restart_parser.set_defaults(func=command_restart)
+
+    # add command
+    add_parser = subparsers.add_parser("add", help="Add a new process and start it")
+    add_parser.add_argument("name", help="Process name")
+    add_parser.add_argument("command", nargs="+", help="Command to run")
+    add_parser.set_defaults(func=command_add)
+
+    # remove command
+    remove_parser = subparsers.add_parser("remove", help="Remove a process")
+    remove_parser.add_argument("name", help="Process name")
+    remove_parser.set_defaults(func=command_remove)
+
+    # show command
+    show_parser = subparsers.add_parser("show", help="Show process command")
+    show_parser.add_argument("name", help="Process name")
+    show_parser.set_defaults(func=command_show)
+
+    # start-all command (used by LaunchAgent)
+    start_all_parser = subparsers.add_parser("start-all", help="Start all configured processes")
+    start_all_parser.set_defaults(func=command_start_all)
+
+    # watch command
+    watch_parser = subparsers.add_parser("watch", help="Monitor and restart dead processes")
+    watch_parser.set_defaults(func=command_watch)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+# ##################################################################
+# standard python pattern for dispatching main
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
