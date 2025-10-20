@@ -8,6 +8,40 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 import daemon_manager as dm
+import installer
+
+# ANSI color codes for vibrant output
+class Color:
+    CYAN = '\033[96m'
+    MAGENTA = '\033[95m'
+    YELLOW = '\033[93m'
+    GREEN = '\033[92m'
+    BLUE = '\033[94m'
+    RED = '\033[91m'
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+
+
+# ##################################################################
+# show banner
+# displays a vibrant colorful banner for the auto daemon manager
+def show_banner() -> None:
+    banner = f"""
+{Color.CYAN}╔═══════════════════════════════════════════════════════════════╗
+{Color.CYAN}║  {Color.YELLOW}{Color.BOLD} ▄▄▄       █    ██ ▄▄▄█████▓ ▒█████  {Color.CYAN}                    ║
+{Color.CYAN}║  {Color.YELLOW}{Color.BOLD}▒████▄     ██  ▓██▒▓  ██▒ ▓▒▒██▒  ██▒{Color.CYAN}                    ║
+{Color.CYAN}║  {Color.GREEN}{Color.BOLD}▒██  ▀█▄  ▓██  ▒██░▒ ▓██░ ▒░▒██░  ██▒{Color.CYAN}                    ║
+{Color.CYAN}║  {Color.GREEN}{Color.BOLD}░██▄▄▄▄██ ▓▓█  ░██░░ ▓██▓ ░ ▒██   ██░{Color.CYAN}                    ║
+{Color.CYAN}║  {Color.MAGENTA}{Color.BOLD} ▓█   ▓██▒▒▒█████▓   ▒██▒ ░ ░ ████▓▒░{Color.CYAN}                    ║
+{Color.CYAN}║  {Color.MAGENTA}{Color.BOLD} ▒▒   ▓▒█░░▒▓▒ ▒ ▒   ▒ ░░   ░ ▒░▒░▒░ {Color.CYAN}                    ║
+{Color.CYAN}║  {Color.BLUE}{Color.BOLD}  ▒   ▒▒ ░░░▒░ ░ ░     ░      ░ ▒ ▒░ {Color.CYAN}                    ║
+{Color.CYAN}║  {Color.BLUE}{Color.BOLD}  ░   ▒    ░░░ ░ ░   ░      ░ ░ ░ ▒  {Color.CYAN}                    ║
+{Color.CYAN}║  {Color.RED}{Color.BOLD}      ░  ░   ░                  ░ ░  {Color.CYAN}                    ║
+{Color.CYAN}║                                                               ║
+{Color.CYAN}║      {Color.GREEN}Daemon Process Manager{Color.CYAN} - {Color.MAGENTA}Keep Your Services Running{Color.CYAN}      ║
+{Color.CYAN}╚═══════════════════════════════════════════════════════════════╝{Color.RESET}
+"""
+    print(banner)
 
 
 # ##################################################################
@@ -144,9 +178,23 @@ def command_watch(args: argparse.Namespace) -> int:
 
 
 # ##################################################################
+# command install
+# installs auto daemon and creates wrapper script in ~/bin
+def command_install(args: argparse.Namespace) -> int:
+    try:
+        installer.install()
+        return 0
+    except Exception as err:
+        print(f"Error: {err}")
+        return 1
+
+
+# ##################################################################
 # main
 # parses arguments and dispatches to the appropriate command handler
 def main(argv: list[str]) -> int:
+    show_banner()
+
     parser = argparse.ArgumentParser(
         prog="auto",
         description="Manage daemon processes"
@@ -195,6 +243,10 @@ def main(argv: list[str]) -> int:
     # watch command
     watch_parser = subparsers.add_parser("watch", help="Monitor and restart dead processes")
     watch_parser.set_defaults(func=command_watch)
+
+    # install command
+    install_parser = subparsers.add_parser("install", help="Install auto daemon and wrapper script")
+    install_parser.set_defaults(func=command_install)
 
     args = parser.parse_args(argv)
     return args.func(args)
