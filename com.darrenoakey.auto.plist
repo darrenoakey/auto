@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.darrenoakey.auto</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/darrenoakey/local/auto/run</string>
+        <string>watch</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/darrenoakey/local/auto/output/logs/auto.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/darrenoakey/local/auto/output/logs/auto.stderr.log</string>
+    <key>KeepAlive</key>
+    <true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/darrenoakey/.local/bin:/Users/darrenoakey/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PYTHONPATH</key>
+        <string>/opt/homebrew/lib/python3.13/site-packages:/Users/darrenoakey/Library/Python/3.13/lib/python/site-packages</string>
+    </dict>
+</dict>
+</plist>

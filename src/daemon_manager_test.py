@@ -178,3 +178,29 @@ def test_backward_compatibility_with_old_state_format(temp_dir):
     assert dm.get_process_status("test") == pid
     assert not dm.is_explicitly_stopped("test")
     os.kill(pid, signal.SIGTERM)
+
+
+# ##################################################################
+# test wait for process death succeeds when process dies
+# ensures wait_for_process_death returns true when process terminates
+def test_wait_for_process_death_succeeds_when_process_dies(temp_dir):
+    dm.add_process("sleeper", "sleep 100")
+    pid = dm.start_process("sleeper")
+    time.sleep(0.1)
+    assert dm.is_process_alive(pid)
+    os.kill(pid, signal.SIGKILL)
+    assert dm.wait_for_process_death(pid, timeout_seconds=5)
+    assert not dm.is_process_alive(pid)
+
+
+# ##################################################################
+# test wait for process death times out when process doesnt die
+# ensures wait_for_process_death returns false when timeout exceeded
+def test_wait_for_process_death_times_out_when_process_doesnt_die(temp_dir):
+    dm.add_process("sleeper", "sleep 100")
+    pid = dm.start_process("sleeper")
+    assert dm.is_process_alive(pid)
+    result = dm.wait_for_process_death(pid, timeout_seconds=0.5)
+    assert not result
+    assert dm.is_process_alive(pid)
+    os.kill(pid, signal.SIGKILL)
