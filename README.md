@@ -26,7 +26,7 @@ Auto helps you manage daemon processes that need to run continuously in the back
 
 ### List all processes
 
-View all configured processes and their current status (PID or "dead"):
+View all configured processes and their current status (PID or "dead") plus port:
 
 ```bash
 auto ps
@@ -37,7 +37,7 @@ auto ps
 Add a process to the configuration and start it immediately:
 
 ```bash
-auto add <name> <command...>
+auto add <name> <command...> [--port <port>] [--workdir <dir>]
 ```
 
 Example:
@@ -78,6 +78,15 @@ Display the full command line for a configured process:
 auto show <name>
 ```
 
+### Show latest log
+
+Print the full path to the latest log file (or tail it):
+
+```bash
+auto log <name>
+auto log <name> --tail
+```
+
 ### Remove a process
 
 Stop a process if running and remove it from configuration:
@@ -94,6 +103,14 @@ Start all configured processes (automatically run at login by LaunchAgent):
 auto start-all
 ```
 
+### Shutdown all processes
+
+Stop all running processes without marking them explicitly stopped:
+
+```bash
+auto shutdown
+```
+
 ### Watch and auto-restart
 
 Monitor all processes and automatically restart any that crash (with exponential backoff):
@@ -107,14 +124,15 @@ auto watch
 ### Running a web server
 
 ```bash
-# Add and start a Flask development server
-auto add flask-dev python3 /home/user/myapp/server.py
+# Add and start a Flask development server (with port/workdir metadata)
+auto add flask-dev python3 /home/user/myapp/server.py --port 8080 --workdir /home/user/myapp
 
 # Check if it's running
 auto ps
 
-# View the logs
-tail -f ~/local/auto/output/logs/flask-dev.stdout.log
+# View the latest log
+auto log flask-dev
+tail -f "$(auto log flask-dev)"
 
 # Restart after making changes
 auto restart flask-dev
@@ -150,11 +168,10 @@ auto watch
 
 ## Process Logs
 
-All process output is captured to files in `output/logs/`:
+All process output is captured under `output/logs/<name>/<YYYY>/<MM>/` with
+timestamped filenames like `myapp_YYMMDD_HHMMSS.log`.
 
-- `<name>.stdout.log` - Standard output
-- `<name>.stderr.log` - Standard error
-- `auto.stdout.log` - LaunchAgent startup log
+Use `auto log <name>` to print the latest log path (or `--tail` to follow).
 
 ## Managing the LaunchAgent
 
@@ -177,6 +194,5 @@ launchctl list | grep com.darrenoakey.auto
 
 ## Configuration Files
 
-- `config.json` - Process definitions (name to command mapping)
-- `state.json` - Runtime state (PIDs and restart tracking)
+- `local/state.json` - Process definitions and runtime state
 - `output/logs/` - Process output logs (automatically created, gitignored)

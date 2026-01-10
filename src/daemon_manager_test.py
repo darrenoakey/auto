@@ -2,6 +2,8 @@
 import os
 import signal
 import time
+from datetime import datetime
+from pathlib import Path
 
 import pytest
 
@@ -24,6 +26,7 @@ def temp_dir(tmp_path, monkeypatch):
         return project_root
 
     monkeypatch.setattr(dm, "get_project_root", get_test_root)
+    monkeypatch.chdir(project_root)
     return project_root
 
 
@@ -31,11 +34,13 @@ def temp_dir(tmp_path, monkeypatch):
 # test add and list process
 # ensures we can add a process and see it in the list
 def test_add_and_list_process(temp_dir):
-    dm.add_process("test1", "echo hello")
+    dm.add_process("test1", "echo hello", port=8080)
     processes = dm.list_processes()
     assert "test1" in processes
     assert processes["test1"]["command"] == "echo hello"
     assert processes["test1"]["pid"] is None
+    assert processes["test1"]["port"] == 8080
+    assert processes["test1"]["workdir"] == str(temp_dir)
 
 
 # ##################################################################
@@ -60,6 +65,17 @@ def test_stop_process_marks_explicitly_stopped(temp_dir):
     assert not dm.is_explicitly_stopped("sleeper")
     dm.stop_process("sleeper")
     assert dm.is_explicitly_stopped("sleeper")
+
+
+# ##################################################################
+# test shutdown does not mark explicitly stopped
+# ensures shutdown stops processes without setting explicitly stopped
+def test_shutdown_does_not_mark_explicitly_stopped(temp_dir):
+    dm.add_process("sleeper", "sleep 100")
+    pid = dm.start_process("sleeper")
+    dm.shutdown_all_processes(timeout_seconds=2)
+    assert not dm.is_explicitly_stopped("sleeper")
+    assert dm.wait_for_process_death(pid, timeout_seconds=2)
 
 
 # ##################################################################
@@ -204,3 +220,36 @@ def test_wait_for_process_death_times_out_when_process_doesnt_die(temp_dir):
     assert not result
     assert dm.is_process_alive(pid)
     os.kill(pid, signal.SIGKILL)
+
+
+# ##################################################################
+# test start process creates timestamped log
+# ensures logs are created under process/year/month with timestamped filename
+def test_start_process_creates_timestamped_log(temp_dir):
+    now = datetime.now()
+    dm.add_process("logger", "sleep 100")
+    pid = dm.start_process("logger")
+    log_path = dm.get_latest_log_path("logger")
+    assert log_path is not None
+    assert log_path.exists()
+    assert log_path.name.startswith("logger_")
+    assert log_path.suffix == ".log"
+    expected_dir = dm.get_log_dir() / "logger" / now.strftime("%Y") / now.strftime("%m")
+    assert log_path.parent == expected_dir
+    os.kill(pid, signal.SIGKILL)
+
+
+# ##################################################################
+# test migrate legacy logs moves root files
+# ensures old flat log files get archived under _legacy
+def test_migrate_legacy_logs_moves_root_files(temp_dir):
+    log_dir = dm.get_log_dir()
+    legacy_file = log_dir / "old.stdout.log"
+    legacy_file.write_text("legacy")
+
+    dm.migrate_legacy_logs()
+
+    assert not legacy_file.exists()
+    legacy_root = log_dir / "_legacy"
+    archived = list(legacy_root.rglob("old.stdout.log"))
+    assert archived

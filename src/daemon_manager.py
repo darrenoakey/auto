@@ -5,6 +5,7 @@ import shutil
 import signal
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -30,6 +31,103 @@ def get_log_dir() -> Path:
     log_dir = get_project_root() / "output" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
+
+
+# ##################################################################
+# migrate legacy logs
+# moves old flat log files into a legacy archive directory once
+def migrate_legacy_logs() -> None:
+    log_dir = get_log_dir()
+    marker_path = log_dir / ".migrated"
+    if marker_path.exists():
+        return
+
+    legacy_files = [
+        path for path in log_dir.iterdir()
+        if path.is_file()
+        and path.name != marker_path.name
+        and path.name not in ("auto.stdout.log", "auto.stderr.log")
+    ]
+
+    if legacy_files:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        legacy_dir = log_dir / "_legacy" / timestamp
+        legacy_dir.mkdir(parents=True, exist_ok=True)
+        for path in legacy_files:
+            shutil.move(str(path), legacy_dir / path.name)
+
+    marker_path.touch()
+
+
+# ##################################################################
+# format log timestamp
+# returns a compact timestamp for log filenames
+def _format_log_timestamp(timestamp: datetime) -> str:
+    return timestamp.strftime("%y%m%d_%H%M%S")
+
+
+# ##################################################################
+# get process log dir
+# returns the year/month directory for a process log
+def _get_process_log_dir(name: str, timestamp: datetime) -> Path:
+    log_dir = get_log_dir()
+    return log_dir / name / timestamp.strftime("%Y") / timestamp.strftime("%m")
+
+
+# ##################################################################
+# ensure unique log path
+# avoids collisions when a log file already exists
+def _ensure_unique_log_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    counter = 1
+    while True:
+        candidate = path.with_name(f"{path.stem}_{counter}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+# ##################################################################
+# get new log path
+# returns a unique log path for the given process
+def get_new_log_path(name: str) -> Path:
+    migrate_legacy_logs()
+    timestamp = datetime.now()
+    log_dir = _get_process_log_dir(name, timestamp)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{name}_{_format_log_timestamp(timestamp)}.log"
+    return _ensure_unique_log_path(log_dir / filename)
+
+
+# ##################################################################
+# get latest log path
+# returns the most recent log file path for a process
+def get_latest_log_path(name: str) -> Optional[Path]:
+    state = load_state()
+    process_state = state.get(name)
+    if isinstance(process_state, dict):
+        log_path = process_state.get("log_path")
+        if log_path:
+            path = Path(log_path)
+            if path.exists():
+                return path
+
+    log_root = get_log_dir()
+    process_root = log_root / name
+    if process_root.exists():
+        candidates = [path for path in process_root.rglob("*.log") if path.is_file()]
+        if candidates:
+            return max(candidates, key=lambda path: path.stat().st_mtime)
+
+    legacy_candidates = [
+        path for path in log_root.rglob("*.log")
+        if path.is_file()
+        and (path.name.startswith(f"{name}.") or path.name.startswith(f"{name}_"))
+    ]
+    if legacy_candidates:
+        return max(legacy_candidates, key=lambda path: path.stat().st_mtime)
+    return None
 
 
 # ##################################################################
@@ -64,8 +162,16 @@ def load_config() -> dict:
     processes = state_data.get("processes", {})
     config = {}
     for name, data in processes.items():
-        if isinstance(data, dict) and "command" in data and data["command"] is not None:
-            config[name] = data["command"]
+        if not isinstance(data, dict):
+            continue
+        command = data.get("command")
+        if command is None:
+            continue
+        config[name] = {
+            "command": command,
+            "port": data.get("port"),
+            "workdir": data.get("workdir")
+        }
     return config
 
 
@@ -77,12 +183,31 @@ def save_config(config: dict) -> None:
     if "processes" not in state_data:
         state_data["processes"] = {}
     for name, command in config.items():
-        if name not in state_data["processes"]:
-            state_data["processes"][name] = {"command": command}
-        elif isinstance(state_data["processes"][name], dict):
-            state_data["processes"][name]["command"] = command
+        if isinstance(command, dict):
+            command_value = command.get("command")
+            port_value = command.get("port")
+            workdir_value = command.get("workdir")
         else:
-            state_data["processes"][name] = {"command": command, "pid": state_data["processes"][name]}
+            command_value = command
+            port_value = None
+            workdir_value = None
+
+        if name not in state_data["processes"]:
+            state_data["processes"][name] = {"command": command_value}
+        elif isinstance(state_data["processes"][name], dict):
+            state_data["processes"][name]["command"] = command_value
+        else:
+            state_data["processes"][name] = {"command": command_value, "pid": state_data["processes"][name]}
+
+        if port_value is not None:
+            state_data["processes"][name]["port"] = port_value
+        else:
+            state_data["processes"][name].pop("port", None)
+
+        if workdir_value is not None:
+            state_data["processes"][name]["workdir"] = workdir_value
+        else:
+            state_data["processes"][name].pop("workdir", None)
     _save_state_file(state_data)
 
 
@@ -101,20 +226,28 @@ def save_state(state: dict) -> None:
     state_data = _load_state_file()
     if "processes" not in state_data:
         state_data["processes"] = {}
+    preserved_fields = ["command", "port", "workdir", "log_path"]
     for name, process_state in state.items():
         if name not in state_data["processes"]:
             state_data["processes"][name] = process_state
         elif isinstance(process_state, dict):
             existing = state_data["processes"][name]
             if isinstance(existing, dict):
-                existing_command = existing.get("command")
                 state_data["processes"][name] = process_state
-                if existing_command is not None:
-                    state_data["processes"][name]["command"] = existing_command
+                for field in preserved_fields:
+                    if field in existing and field not in state_data["processes"][name]:
+                        state_data["processes"][name][field] = existing[field]
             else:
                 state_data["processes"][name] = process_state
         else:
-            state_data["processes"][name] = process_state
+            existing = state_data["processes"][name]
+            if isinstance(existing, dict):
+                state_data["processes"][name] = {"pid": process_state}
+                for field in preserved_fields:
+                    if field in existing:
+                        state_data["processes"][name][field] = existing[field]
+            else:
+                state_data["processes"][name] = process_state
     _save_state_file(state_data)
 
 
@@ -191,24 +324,25 @@ def start_process(name: str) -> int:
     if current_pid is not None:
         raise RuntimeError(f"Process {name} is already running with pid {current_pid}")
 
-    command = config[name]
-    log_dir = get_log_dir()
-    stdout_log = log_dir / f"{name}.stdout.log"
-    stderr_log = log_dir / f"{name}.stderr.log"
+    process_config = config[name]
+    command = process_config["command"]
+    workdir = process_config.get("workdir")
+    log_path = get_new_log_path(name)
 
-    # open log files
-    stdout_file = open(stdout_log, "a")
-    stderr_file = open(stderr_log, "a")
+    # open log file
+    log_file = open(log_path, "w")
 
     # start process with exec to replace shell with actual command
     wrapped_command = f"exec {command}"
     process = subprocess.Popen(
         wrapped_command,
         shell=True,
-        stdout=stdout_file,
-        stderr=stderr_file,
-        start_new_session=True
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        cwd=workdir or None
     )
+    log_file.close()
 
     # update state, preserving existing restart_attempt and last_restart_time
     state = load_state()
@@ -219,7 +353,8 @@ def start_process(name: str) -> int:
         "pid": process.pid,
         "explicitly_stopped": False,
         "restart_attempt": existing.get("restart_attempt", 0),
-        "last_restart_time": existing.get("last_restart_time")
+        "last_restart_time": existing.get("last_restart_time"),
+        "log_path": str(log_path)
     }
     save_state(state)
 
@@ -242,7 +377,7 @@ def wait_for_process_death(pid: int, timeout_seconds: int = 10, poll_interval: f
 # ##################################################################
 # stop process
 # sends sigterm to a running process and marks it as explicitly stopped
-def stop_process(name: str) -> None:
+def stop_process(name: str, mark_explicit: bool = True) -> None:
     pid = get_process_status(name)
     if pid is None:
         raise RuntimeError(f"Process {name} is not running")
@@ -252,24 +387,59 @@ def stop_process(name: str) -> None:
     except OSError as err:
         raise RuntimeError(f"Failed to stop process {name} with pid {pid}: {err}")
 
-    # mark as explicitly stopped
-    state = load_state()
-    if name in state:
-        if isinstance(state[name], int):
-            state[name] = {"pid": state[name], "explicitly_stopped": True}
-        else:
-            state[name]["explicitly_stopped"] = True
-        save_state(state)
+    if mark_explicit:
+        # mark as explicitly stopped
+        state = load_state()
+        if name in state:
+            if isinstance(state[name], int):
+                state[name] = {"pid": state[name], "explicitly_stopped": True}
+            else:
+                state[name]["explicitly_stopped"] = True
+            save_state(state)
+
+
+# ##################################################################
+# shutdown all processes
+# stops all running processes without marking them explicitly stopped
+def shutdown_all_processes(timeout_seconds: int = 10) -> None:
+    config = load_config()
+    for name in config:
+        pid = get_process_status(name)
+        if pid is None:
+            continue
+        try:
+            stop_process(name, mark_explicit=False)
+            if not wait_for_process_death(pid, timeout_seconds=timeout_seconds):
+                print(f"Warning: process {name} did not die within timeout")
+        except Exception as err:
+            print(f"Failed to stop {name}: {err}")
 
 
 # ##################################################################
 # add process
 # adds a new process definition to config
-def add_process(name: str, command: str) -> None:
+def add_process(name: str, command: str, port: Optional[int] = None, workdir: Optional[str] = None) -> None:
     config = load_config()
     if name in config:
         raise ValueError(f"Process {name} already exists")
-    config[name] = command
+
+    if port is not None:
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            raise ValueError("Port must be an integer")
+        if port < 1 or port > 65535:
+            raise ValueError("Port must be between 1 and 65535")
+
+    if workdir is None:
+        workdir = str(Path.cwd())
+    else:
+        workdir_path = Path(workdir).expanduser().resolve()
+        if not workdir_path.is_dir():
+            raise ValueError(f"Workdir does not exist: {workdir_path}")
+        workdir = str(workdir_path)
+
+    config[name] = {"command": command, "port": port, "workdir": workdir}
     save_config(config)
 
 
@@ -299,9 +469,14 @@ def remove_process(name: str) -> None:
 def list_processes() -> dict:
     config = load_config()
     result = {}
-    for name in config:
+    for name, definition in config.items():
         pid = get_process_status(name)
-        result[name] = {"command": config[name], "pid": pid}
+        result[name] = {
+            "command": definition["command"],
+            "pid": pid,
+            "port": definition.get("port"),
+            "workdir": definition.get("workdir")
+        }
     return result
 
 
@@ -312,7 +487,7 @@ def get_process_command(name: str) -> str:
     config = load_config()
     if name not in config:
         raise ValueError(f"Process {name} not found in config")
-    return config[name]
+    return config[name]["command"]
 
 
 # ##################################################################
