@@ -34,8 +34,17 @@ def get_log_dir() -> Path:
 
 
 # ##################################################################
+# get auto log path
+# returns the path for the auto daemon log file
+def get_auto_log_path() -> Path:
+    log_dir = get_log_dir() / "auto"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / "auto.log"
+
+
+# ##################################################################
 # migrate legacy logs
-# moves old flat log files into a legacy archive directory once
+# moves old flat log files into an old archive directory once
 def migrate_legacy_logs() -> None:
     log_dir = get_log_dir()
     marker_path = log_dir / ".migrated"
@@ -44,17 +53,21 @@ def migrate_legacy_logs() -> None:
 
     legacy_files = [
         path for path in log_dir.iterdir()
-        if path.is_file()
-        and path.name != marker_path.name
-        and path.name not in ("auto.stdout.log", "auto.stderr.log")
+        if path.is_file() and path.name != marker_path.name
     ]
 
+    legacy_dir = log_dir / "old"
     if legacy_files:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        legacy_dir = log_dir / "_legacy" / timestamp
         legacy_dir.mkdir(parents=True, exist_ok=True)
         for path in legacy_files:
-            shutil.move(str(path), legacy_dir / path.name)
+            destination = _ensure_unique_path(legacy_dir / path.name)
+            shutil.move(str(path), destination)
+
+    previous_legacy = log_dir / "_legacy"
+    if previous_legacy.exists():
+        legacy_dir.mkdir(parents=True, exist_ok=True)
+        destination = _ensure_unique_path(legacy_dir / previous_legacy.name)
+        shutil.move(str(previous_legacy), destination)
 
     marker_path.touch()
 
@@ -75,9 +88,9 @@ def _get_process_log_dir(name: str, timestamp: datetime) -> Path:
 
 
 # ##################################################################
-# ensure unique log path
-# avoids collisions when a log file already exists
-def _ensure_unique_log_path(path: Path) -> Path:
+# ensure unique path
+# avoids collisions when a file already exists
+def _ensure_unique_path(path: Path) -> Path:
     if not path.exists():
         return path
     counter = 1
@@ -97,7 +110,7 @@ def get_new_log_path(name: str) -> Path:
     log_dir = _get_process_log_dir(name, timestamp)
     log_dir.mkdir(parents=True, exist_ok=True)
     filename = f"{name}_{_format_log_timestamp(timestamp)}.log"
-    return _ensure_unique_log_path(log_dir / filename)
+    return _ensure_unique_path(log_dir / filename)
 
 
 # ##################################################################
@@ -113,21 +126,13 @@ def get_latest_log_path(name: str) -> Optional[Path]:
             if path.exists():
                 return path
 
-    log_root = get_log_dir()
-    process_root = log_root / name
-    if process_root.exists():
-        candidates = [path for path in process_root.rglob("*.log") if path.is_file()]
-        if candidates:
-            return max(candidates, key=lambda path: path.stat().st_mtime)
-
-    legacy_candidates = [
-        path for path in log_root.rglob("*.log")
-        if path.is_file()
-        and (path.name.startswith(f"{name}.") or path.name.startswith(f"{name}_"))
-    ]
-    if legacy_candidates:
-        return max(legacy_candidates, key=lambda path: path.stat().st_mtime)
-    return None
+    process_root = get_log_dir() / name
+    if not process_root.exists():
+        return None
+    candidates = [path for path in process_root.rglob("*.log") if path.is_file()]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
 # ##################################################################
@@ -383,7 +388,10 @@ def stop_process(name: str, mark_explicit: bool = True) -> None:
         raise RuntimeError(f"Process {name} is not running")
 
     try:
-        os.kill(pid, signal.SIGTERM)
+        # kill the entire process group since we start with start_new_session=True
+        # this ensures child processes (like uvicorn reloader/worker) are also terminated
+        pgid = os.getpgid(pid)
+        os.killpg(pgid, signal.SIGTERM)
     except OSError as err:
         raise RuntimeError(f"Failed to stop process {name} with pid {pid}: {err}")
 
@@ -615,7 +623,7 @@ def get_plist_template_path() -> Path:
 def _generate_plist_content() -> str:
     project_root = get_project_root()
     run_script = project_root / "run"
-    log_dir = project_root / "output" / "logs"
+    auto_log_path = get_auto_log_path()
 
     # get current PATH from environment
     current_path = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
@@ -634,9 +642,9 @@ def _generate_plist_content() -> str:
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>{log_dir}/auto.stdout.log</string>
+    <string>{auto_log_path}</string>
     <key>StandardErrorPath</key>
-    <string>{log_dir}/auto.stderr.log</string>
+    <string>{auto_log_path}</string>
     <key>KeepAlive</key>
     <true/>
     <key>EnvironmentVariables</key>

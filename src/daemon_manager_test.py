@@ -250,6 +250,6 @@ def test_migrate_legacy_logs_moves_root_files(temp_dir):
     dm.migrate_legacy_logs()
 
     assert not legacy_file.exists()
-    legacy_root = log_dir / "_legacy"
+    legacy_root = log_dir / "old"
     archived = list(legacy_root.rglob("old.stdout.log"))
     assert archived

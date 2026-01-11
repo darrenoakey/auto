@@ -80,11 +80,12 @@ auto show <name>
 
 ### Show latest log
 
-Print the full path to the latest log file (or tail it):
+Show the latest log (or print its full path):
 
 ```bash
 auto log <name>
-auto log <name> --tail
+auto log --tail <name>
+auto log --name <name>
 ```
 
 ### Remove a process
@@ -132,7 +133,8 @@ auto ps
 
 # View the latest log
 auto log flask-dev
-tail -f "$(auto log flask-dev)"
+auto log --tail flask-dev
+auto log --name flask-dev
 
 # Restart after making changes
 auto restart flask-dev
@@ -171,7 +173,8 @@ auto watch
 All process output is captured under `output/logs/<name>/<YYYY>/<MM>/` with
 timestamped filenames like `myapp_YYMMDD_HHMMSS.log`.
 
-Use `auto log <name>` to print the latest log path (or `--tail` to follow).
+Use `auto log <name>` to show the latest log, `auto log --tail <name>` to follow it, or
+`auto log --name <name>` to print its path.
 
 ## Managing the LaunchAgent
 

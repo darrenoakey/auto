@@ -12,9 +12,9 @@
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/Users/darrenoakey/local/auto/output/logs/auto.stdout.log</string>
+    <string>/Users/darrenoakey/local/auto/output/logs/auto/auto.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/darrenoakey/local/auto/output/logs/auto.stderr.log</string>
+    <string>/Users/darrenoakey/local/auto/output/logs/auto/auto.log</string>
     <key>KeepAlive</key>
     <true/>
     <key>EnvironmentVariables</key>

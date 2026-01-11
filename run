@@ -151,16 +151,22 @@ def command_show(args: argparse.Namespace) -> int:
 # shows the latest log path or tails it for a process
 def command_log(args: argparse.Namespace) -> int:
     name = args.name
+    if not name:
+        print("Error: process name is required")
+        return 1
     try:
         log_path = dm.get_latest_log_path(name)
         if log_path is None:
             print(f"No logs found for {name}")
             return 1
-        if args.tail:
-            subprocess.run(["tail", "-f", str(log_path)])
+        if args.name_only:
+            print(log_path)
             return 0
-        print(log_path)
-        return 0
+        if args.tail:
+            result = subprocess.run(["tail", "-f", str(log_path)])
+            return result.returncode
+        result = subprocess.run(["cat", str(log_path)])
+        return result.returncode
     except Exception as err:
         print(f"Error: {err}")
         return 1
@@ -298,9 +304,10 @@ def main(argv: list[str]) -> int:
     show_parser.set_defaults(func=command_show)
 
     # log command
-    log_parser = subparsers.add_parser("log", help="Show latest log path for a process")
+    log_parser = subparsers.add_parser("log", help="Show or follow the latest log for a process")
     log_parser.add_argument("name", help="Process name")
     log_parser.add_argument("--tail", action="store_true", help="Tail the latest log")
+    log_parser.add_argument("--name", dest="name_only", action="store_true", help="Print latest log path only")
     log_parser.set_defaults(func=command_log)
 
     # start-all command (used by LaunchAgent)
