@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -9,6 +8,40 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 import daemon_manager as dm
+import installer
+
+# ANSI color codes for vibrant output
+class Color:
+    CYAN = '\033[96m'
+    MAGENTA = '\033[95m'
+    YELLOW = '\033[93m'
+    GREEN = '\033[92m'
+    BLUE = '\033[94m'
+    RED = '\033[91m'
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+
+
+# ##################################################################
+# show banner
+# displays a vibrant colorful banner for the auto daemon manager
+def show_banner() -> None:
+    banner = f"""
+{Color.CYAN}╔═══════════════════════════════════════════════════════════════╗
+{Color.CYAN}║  {Color.YELLOW}{Color.BOLD} ▄▄▄       █    ██ ▄▄▄█████▓ ▒█████  {Color.CYAN}                    ║
+{Color.CYAN}║  {Color.YELLOW}{Color.BOLD}▒████▄     ██  ▓██▒▓  ██▒ ▓▒▒██▒  ██▒{Color.CYAN}                    ║
+{Color.CYAN}║  {Color.GREEN}{Color.BOLD}▒██  ▀█▄  ▓██  ▒██░▒ ▓██░ ▒░▒██░  ██▒{Color.CYAN}                    ║
+{Color.CYAN}║  {Color.GREEN}{Color.BOLD}░██▄▄▄▄██ ▓▓█  ░██░░ ▓██▓ ░ ▒██   ██░{Color.CYAN}                    ║
+{Color.CYAN}║  {Color.MAGENTA}{Color.BOLD} ▓█   ▓██▒▒▒█████▓   ▒██▒ ░ ░ ████▓▒░{Color.CYAN}                    ║
+{Color.CYAN}║  {Color.MAGENTA}{Color.BOLD} ▒▒   ▓▒█░░▒▓▒ ▒ ▒   ▒ ░░   ░ ▒░▒░▒░ {Color.CYAN}                    ║
+{Color.CYAN}║  {Color.BLUE}{Color.BOLD}  ▒   ▒▒ ░░░▒░ ░ ░     ░      ░ ▒ ▒░ {Color.CYAN}                    ║
+{Color.CYAN}║  {Color.BLUE}{Color.BOLD}  ░   ▒    ░░░ ░ ░   ░      ░ ░ ░ ▒  {Color.CYAN}                    ║
+{Color.CYAN}║  {Color.RED}{Color.BOLD}      ░  ░   ░                  ░ ░  {Color.CYAN}                    ║
+{Color.CYAN}║                                                               ║
+{Color.CYAN}║      {Color.GREEN}Daemon Process Manager{Color.CYAN} - {Color.MAGENTA}Keep Your Services Running{Color.CYAN}      ║
+{Color.CYAN}╚═══════════════════════════════════════════════════════════════╝{Color.RESET}
+"""
+    print(banner)
 
 
 # ##################################################################
@@ -20,20 +53,10 @@ def command_ps(args: argparse.Namespace) -> int:
         print("No processes configured")
         return 0
 
-    rows = []
     for name, info in sorted(processes.items()):
         pid = info["pid"]
-        pid_str = str(pid) if pid is not None else "dead"
-        port = info.get("port")
-        port_str = str(port) if port is not None else "-"
-        rows.append((name, pid_str, port_str))
-
-    name_width = max(len(row[0]) for row in rows)
-    pid_width = max(len(row[1]) for row in rows)
-    port_width = max(len(row[2]) for row in rows)
-
-    for name, pid_str, port_str in rows:
-        print(f"{name.ljust(name_width)}  {pid_str.rjust(pid_width)}  {port_str.rjust(port_width)}")
+        status = str(pid) if pid is not None else "dead"
+        print(f"{name}: {status}")
     return 0
 
 
@@ -77,18 +100,6 @@ def command_restart(args: argparse.Namespace) -> int:
             dm.stop_process(name)
             print(f"Stopped {name}")
 
-            # wait for process to completely die
-            if not dm.wait_for_process_death(pid, timeout_seconds=10):
-                print(f"Warning: process {name} did not die within timeout, forcing kill")
-                try:
-                    import os
-                    import signal
-                    os.kill(pid, signal.SIGKILL)
-                    # wait a bit more for SIGKILL to take effect
-                    dm.wait_for_process_death(pid, timeout_seconds=2)
-                except OSError:
-                    pass
-
         # start
         pid = dm.start_process(name)
         print(f"Started {name} with pid {pid}")
@@ -105,10 +116,7 @@ def command_add(args: argparse.Namespace) -> int:
     name = args.name
     command = " ".join(args.command)
     try:
-        workdir = args.workdir
-        if workdir is None:
-            workdir = str(Path.cwd())
-        dm.add_process(name, command, port=args.port, workdir=workdir)
+        dm.add_process(name, command)
         print(f"Added {name}")
         pid = dm.start_process(name)
         print(f"Started {name} with pid {pid}")
@@ -147,32 +155,6 @@ def command_show(args: argparse.Namespace) -> int:
 
 
 # ##################################################################
-# command log
-# shows the latest log path or tails it for a process
-def command_log(args: argparse.Namespace) -> int:
-    name = args.name
-    if not name:
-        print("Error: process name is required")
-        return 1
-    try:
-        log_path = dm.get_latest_log_path(name)
-        if log_path is None:
-            print(f"No logs found for {name}")
-            return 1
-        if args.name_only:
-            print(log_path)
-            return 0
-        if args.tail:
-            result = subprocess.run(["tail", "-f", str(log_path)])
-            return result.returncode
-        result = subprocess.run(["cat", str(log_path)])
-        return result.returncode
-    except Exception as err:
-        print(f"Error: {err}")
-        return 1
-
-
-# ##################################################################
 # command start all
 # starts all configured processes that are not currently running
 def command_start_all(args: argparse.Namespace) -> int:
@@ -196,70 +178,23 @@ def command_watch(args: argparse.Namespace) -> int:
 
 
 # ##################################################################
-# command shutdown
-# stops all running processes without marking them explicitly stopped
-def command_shutdown(args: argparse.Namespace) -> int:
-    try:
-        dm.shutdown_all_processes(timeout_seconds=args.timeout)
-        print("Stopped all running processes")
-        return 0
-    except Exception as err:
-        print(f"Error: {err}")
-        return 1
-
-
-# ##################################################################
 # command install
-# installs both wrapper script and launch agent plist file
+# installs auto daemon and creates wrapper script in ~/bin
 def command_install(args: argparse.Namespace) -> int:
     try:
-        # install wrapper script
-        dm.install_wrapper_script()
-        wrapper_path = dm.get_wrapper_script_path()
-        print(f"Installed wrapper script to {wrapper_path}")
-
-        # install launch agent
-        dm.install_launch_agent()
-        launch_agent_path = dm.get_launch_agent_path()
-        print(f"Installed launch agent to {launch_agent_path}")
-        print("The auto daemon will now start automatically at login")
+        installer.install()
         return 0
     except Exception as err:
         print(f"Error: {err}")
         return 1
-
-
-# ##################################################################
-# command uninstall
-# uninstalls both launch agent and wrapper script
-def command_uninstall(args: argparse.Namespace) -> int:
-    try:
-        # uninstall launch agent
-        dm.uninstall_launch_agent()
-        print("Uninstalled launch agent")
-
-        # uninstall wrapper script
-        dm.uninstall_wrapper_script()
-        print("Uninstalled wrapper script")
-        print("The auto daemon will no longer start automatically at login")
-        return 0
-    except Exception as err:
-        print(f"Error: {err}")
-        return 1
-
-
-# ##################################################################
-# command verify
-# runs the full verification suite (pytest)
-def command_verify(args: argparse.Namespace) -> int:
-    result = subprocess.run([sys.executable, "-m", "pytest"])
-    return result.returncode
 
 
 # ##################################################################
 # main
 # parses arguments and dispatches to the appropriate command handler
 def main(argv: list[str]) -> int:
+    show_banner()
+
     parser = argparse.ArgumentParser(
         prog="auto",
         description="Manage daemon processes"
@@ -289,8 +224,6 @@ def main(argv: list[str]) -> int:
     add_parser = subparsers.add_parser("add", help="Add a new process and start it")
     add_parser.add_argument("name", help="Process name")
     add_parser.add_argument("command", nargs="+", help="Command to run")
-    add_parser.add_argument("--port", type=int, help="Optional port number")
-    add_parser.add_argument("--workdir", help="Working directory to run the process in")
     add_parser.set_defaults(func=command_add)
 
     # remove command
@@ -303,13 +236,6 @@ def main(argv: list[str]) -> int:
     show_parser.add_argument("name", help="Process name")
     show_parser.set_defaults(func=command_show)
 
-    # log command
-    log_parser = subparsers.add_parser("log", help="Show or follow the latest log for a process")
-    log_parser.add_argument("name", help="Process name")
-    log_parser.add_argument("--tail", action="store_true", help="Tail the latest log")
-    log_parser.add_argument("--name", dest="name_only", action="store_true", help="Print latest log path only")
-    log_parser.set_defaults(func=command_log)
-
     # start-all command (used by LaunchAgent)
     start_all_parser = subparsers.add_parser("start-all", help="Start all configured processes")
     start_all_parser.set_defaults(func=command_start_all)
@@ -318,22 +244,9 @@ def main(argv: list[str]) -> int:
     watch_parser = subparsers.add_parser("watch", help="Monitor and restart dead processes")
     watch_parser.set_defaults(func=command_watch)
 
-    # shutdown command
-    shutdown_parser = subparsers.add_parser("shutdown", help="Stop all running processes without marking them stopped")
-    shutdown_parser.add_argument("--timeout", type=int, default=10, help="Seconds to wait for each process to exit")
-    shutdown_parser.set_defaults(func=command_shutdown)
-
     # install command
-    install_parser = subparsers.add_parser("install", help="Install launch agent for automatic startup at login")
+    install_parser = subparsers.add_parser("install", help="Install auto daemon and wrapper script")
     install_parser.set_defaults(func=command_install)
-
-    # uninstall command
-    uninstall_parser = subparsers.add_parser("uninstall", help="Uninstall launch agent")
-    uninstall_parser.set_defaults(func=command_uninstall)
-
-    # verify command
-    verify_parser = subparsers.add_parser("verify", help="Run verification suite")
-    verify_parser.set_defaults(func=command_verify)
 
     args = parser.parse_args(argv)
     return args.func(args)
