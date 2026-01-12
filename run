@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -155,6 +156,30 @@ def command_show(args: argparse.Namespace) -> int:
 
 
 # ##################################################################
+# command log
+# displays or tails the latest log file for a process
+def command_log(args: argparse.Namespace) -> int:
+    name = args.name
+    log_path = dm.get_latest_log_path(name)
+
+    if log_path is None:
+        print(f"No log file found for {name}")
+        return 1
+
+    if args.file:
+        print(log_path)
+        return 0
+
+    if args.tail:
+        subprocess.run(["tail", "-f", str(log_path)])
+        return 0
+
+    # default: cat the file
+    print(log_path.read_text(), end="")
+    return 0
+
+
+# ##################################################################
 # command start all
 # starts all configured processes that are not currently running
 def command_start_all(args: argparse.Namespace) -> int:
@@ -235,6 +260,13 @@ def main(argv: list[str]) -> int:
     show_parser = subparsers.add_parser("show", help="Show process command")
     show_parser.add_argument("name", help="Process name")
     show_parser.set_defaults(func=command_show)
+
+    # log command
+    log_parser = subparsers.add_parser("log", help="Show process log")
+    log_parser.add_argument("name", help="Process name")
+    log_parser.add_argument("--file", action="store_true", help="Print log file path only")
+    log_parser.add_argument("--tail", action="store_true", help="Tail the log file")
+    log_parser.set_defaults(func=command_log)
 
     # start-all command (used by LaunchAgent)
     start_all_parser = subparsers.add_parser("start-all", help="Start all configured processes")
