@@ -54,10 +54,20 @@ def command_ps(args: argparse.Namespace) -> int:
         print("No processes configured")
         return 0
 
+    # calculate column widths
+    name_width = max(len(name) for name in processes.keys())
+    name_width = max(name_width, len("NAME"))
+
+    # print header
+    print(f"{'NAME':<{name_width}}  {'PID':>6}  {'PORT':>5}")
+
+    # print each process
     for name, info in sorted(processes.items()):
         pid = info["pid"]
-        status = str(pid) if pid is not None else "dead"
-        print(f"{name}: {status}")
+        port = info.get("port")
+        pid_str = str(pid) if pid is not None else "dead"
+        port_str = str(port) if port is not None else "-"
+        print(f"{name:<{name_width}}  {pid_str:>6}  {port_str:>5}")
     return 0
 
 
@@ -116,11 +126,26 @@ def command_restart(args: argparse.Namespace) -> int:
 def command_add(args: argparse.Namespace) -> int:
     name = args.name
     command = " ".join(args.command)
+    port = args.port
     try:
-        dm.add_process(name, command)
+        dm.add_process(name, command, port=port)
         print(f"Added {name}")
         pid = dm.start_process(name)
         print(f"Started {name} with pid {pid}")
+        return 0
+    except Exception as err:
+        print(f"Error: {err}")
+        return 1
+
+
+# ##################################################################
+# command update
+# updates settings for an existing process
+def command_update(args: argparse.Namespace) -> int:
+    name = args.name
+    try:
+        dm.update_process(name, port=args.port, workdir=args.workdir)
+        print(f"Updated {name}")
         return 0
     except Exception as err:
         print(f"Error: {err}")
@@ -249,7 +274,15 @@ def main(argv: list[str]) -> int:
     add_parser = subparsers.add_parser("add", help="Add a new process and start it")
     add_parser.add_argument("name", help="Process name")
     add_parser.add_argument("command", nargs="+", help="Command to run")
+    add_parser.add_argument("--port", type=int, help="Port the process listens on")
     add_parser.set_defaults(func=command_add)
+
+    # update command
+    update_parser = subparsers.add_parser("update", help="Update settings for an existing process")
+    update_parser.add_argument("name", help="Process name")
+    update_parser.add_argument("--port", type=int, help="Port the process listens on")
+    update_parser.add_argument("--workdir", help="Working directory for the process")
+    update_parser.set_defaults(func=command_update)
 
     # remove command
     remove_parser = subparsers.add_parser("remove", help="Remove a process")

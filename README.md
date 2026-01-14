@@ -55,6 +55,9 @@ auto ps
 # Add a new process and start it
 auto add myapp "python3 /path/to/app.py"
 
+# Add a process with port information
+auto add myapi "python3 /path/to/api.py" --port 8080
+
 # Start a stopped process
 auto start myapp
 
@@ -85,13 +88,15 @@ auto watch
 
 | Command | Description |
 |---------|-------------|
-| `ps` | List all configured processes with their PIDs (or "dead" if not running) |
+| `ps` | List all configured processes with PIDs and ports in aligned columns |
 | `start <name>` | Start a configured process |
 | `stop <name>` | Stop a running process (marks as explicitly stopped) |
 | `restart <name>` | Stop and start a process |
-| `add <name> <command>` | Add a new process to the configuration and start it |
+| `add <name> <command> [--port PORT]` | Add a new process to the configuration and start it |
+| `update <name> [--port PORT] [--workdir DIR]` | Update settings for an existing process |
 | `remove <name>` | Stop and remove a process from the configuration |
 | `show <name>` | Display the command line for a process |
+| `log <name> [--tail] [--file]` | View process log (--tail for live, --file for path only) |
 | `start-all` | Start all configured processes that aren't running |
 | `watch` | Continuously monitor and restart crashed processes |
 | `install` | Install the daemon and wrapper script |
@@ -195,9 +200,10 @@ auto add redis "redis-server /etc/redis.conf"
 auto ps
 
 # Output:
-# api-server: 12345
-# redis: 12347
-# web-ui: 12346
+# NAME        PID   PORT
+# api-server  12345  8000
+# redis       12347     -
+# web-ui      12346  3000
 ```
 
 ## Logs

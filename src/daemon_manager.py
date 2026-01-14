@@ -452,6 +452,32 @@ def add_process(name: str, command: str, port: Optional[int] = None, workdir: Op
 
 
 # ##################################################################
+# update process
+# updates an existing process definition in config
+def update_process(name: str, port: Optional[int] = None, workdir: Optional[str] = None) -> None:
+    config = load_config()
+    if name not in config:
+        raise ValueError(f"Process {name} not found in config")
+
+    if port is not None:
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            raise ValueError("Port must be an integer")
+        if port < 1 or port > 65535:
+            raise ValueError("Port must be between 1 and 65535")
+        config[name]["port"] = port
+
+    if workdir is not None:
+        workdir_path = Path(workdir).expanduser().resolve()
+        if not workdir_path.is_dir():
+            raise ValueError(f"Workdir does not exist: {workdir_path}")
+        config[name]["workdir"] = str(workdir_path)
+
+    save_config(config)
+
+
+# ##################################################################
 # remove process
 # removes a process definition and all state from the state file and stops it if running
 def remove_process(name: str) -> None:

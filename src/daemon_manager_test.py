@@ -253,3 +253,37 @@ def test_migrate_legacy_logs_moves_root_files(temp_dir):
     legacy_root = log_dir / "old"
     archived = list(legacy_root.rglob("old.stdout.log"))
     assert archived
+
+
+# ##################################################################
+# test update process port
+# ensures we can update the port of an existing process
+def test_update_process_port(temp_dir):
+    dm.add_process("test", "echo hello", port=8080)
+    processes = dm.list_processes()
+    assert processes["test"]["port"] == 8080
+
+    dm.update_process("test", port=9090)
+    processes = dm.list_processes()
+    assert processes["test"]["port"] == 9090
+
+
+# ##################################################################
+# test update process workdir
+# ensures we can update the workdir of an existing process
+def test_update_process_workdir(temp_dir):
+    dm.add_process("test", "echo hello")
+    new_dir = temp_dir / "subdir"
+    new_dir.mkdir()
+
+    dm.update_process("test", workdir=str(new_dir))
+    processes = dm.list_processes()
+    assert processes["test"]["workdir"] == str(new_dir)
+
+
+# ##################################################################
+# test update process nonexistent raises
+# ensures updating a non-existent process raises an error
+def test_update_process_nonexistent_raises(temp_dir):
+    with pytest.raises(ValueError, match="not found"):
+        dm.update_process("nonexistent", port=8080)
