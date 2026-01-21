@@ -287,3 +287,66 @@ def test_update_process_workdir(temp_dir):
 def test_update_process_nonexistent_raises(temp_dir):
     with pytest.raises(ValueError, match="not found"):
         dm.update_process("nonexistent", port=8080)
+
+
+# ##################################################################
+# test is port free returns true for unused port
+# ensures is_port_free correctly detects available ports
+def test_is_port_free_returns_true_for_unused_port(temp_dir):
+    import socket
+    # find an unused port
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    # port should be free now that socket is closed
+    assert dm.is_port_free(port)
+
+
+# ##################################################################
+# test is port free returns false for used port
+# ensures is_port_free correctly detects ports in use
+def test_is_port_free_returns_false_for_used_port(temp_dir):
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    try:
+        assert not dm.is_port_free(port)
+    finally:
+        sock.close()
+
+
+# ##################################################################
+# test wait for port free succeeds when port freed
+# ensures wait_for_port_free returns true when port becomes available
+def test_wait_for_port_free_succeeds_when_port_freed(temp_dir):
+    import socket
+    import threading
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+
+    def release_port():
+        time.sleep(0.2)
+        sock.close()
+
+    thread = threading.Thread(target=release_port)
+    thread.start()
+    result = dm.wait_for_port_free(port, timeout_seconds=2)
+    thread.join()
+    assert result
+
+
+# ##################################################################
+# test wait for port free times out when port busy
+# ensures wait_for_port_free returns false when timeout exceeded
+def test_wait_for_port_free_times_out_when_port_busy(temp_dir):
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    try:
+        result = dm.wait_for_port_free(port, timeout_seconds=0.3)
+        assert not result
+    finally:
+        sock.close()

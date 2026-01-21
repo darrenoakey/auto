@@ -285,6 +285,32 @@ def is_process_alive(pid: int) -> bool:
 
 
 # ##################################################################
+# is port free
+# checks if a TCP port is available for binding
+def is_port_free(port: int) -> bool:
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+# ##################################################################
+# wait for port free
+# polls until a port is free or timeout is reached
+def wait_for_port_free(port: int, timeout_seconds: float = 10, poll_interval: float = 0.1) -> bool:
+    elapsed = 0.0
+    while elapsed < timeout_seconds:
+        if is_port_free(port):
+            return True
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+    return False
+
+
+# ##################################################################
 # is explicitly stopped
 # checks if a process has been marked as explicitly stopped by the user
 def is_explicitly_stopped(name: str) -> bool:
@@ -369,7 +395,7 @@ def start_process(name: str) -> int:
 # ##################################################################
 # wait for process death
 # polls until a process with the given pid is no longer running with timeout
-def wait_for_process_death(pid: int, timeout_seconds: int = 10, poll_interval: float = 0.1) -> bool:
+def wait_for_process_death(pid: int, timeout_seconds: float = 10, poll_interval: float = 0.1) -> bool:
     elapsed = 0.0
     while elapsed < timeout_seconds:
         if not is_process_alive(pid):

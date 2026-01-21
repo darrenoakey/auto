@@ -105,11 +105,30 @@ def command_stop(args: argparse.Namespace) -> int:
 def command_restart(args: argparse.Namespace) -> int:
     name = args.name
     try:
-        # stop if running
+        # get process config for port info
+        config = dm.load_config()
+        if name not in config:
+            print(f"Error: Process {name} not found in config")
+            return 1
+        port = config[name].get("port")
+
+        # stop if running and wait for it to die
         pid = dm.get_process_status(name)
         if pid is not None:
             dm.stop_process(name)
+            print(f"Stopping {name}...")
+            if not dm.wait_for_process_death(pid, timeout_seconds=10):
+                print(f"Error: Process {name} did not die within timeout")
+                return 1
             print(f"Stopped {name}")
+
+        # wait for port to be free if configured
+        if port is not None:
+            if not dm.is_port_free(port):
+                print(f"Waiting for port {port} to be free...")
+                if not dm.wait_for_port_free(port, timeout_seconds=10):
+                    print(f"Error: Port {port} is still in use after timeout")
+                    return 1
 
         # start
         pid = dm.start_process(name)
