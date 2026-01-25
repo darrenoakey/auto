@@ -257,6 +257,23 @@ def save_state(state: dict) -> None:
 
 
 # ##################################################################
+# get process start time
+# returns the start time string for a process or None if not found
+def get_process_start_time(pid: int) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip() or None
+    except Exception:
+        return None
+
+
+# ##################################################################
 # is process alive
 # checks if a process with the given pid is currently running and not a zombie
 def is_process_alive(pid: int) -> bool:
@@ -270,7 +287,6 @@ def is_process_alive(pid: int) -> bool:
                 return state not in ("Z", "X")
         except FileNotFoundError:
             # proc filesystem not available on macos so use ps
-            import subprocess
             result = subprocess.run(
                 ["ps", "-p", str(pid), "-o", "state="],
                 capture_output=True,
@@ -282,6 +298,22 @@ def is_process_alive(pid: int) -> bool:
             return state not in ("Z", "Z+")
     except OSError:
         return False
+
+
+# ##################################################################
+# is our process
+# checks if pid is alive AND matches the stored start time (handles PID reuse after reboot)
+def is_our_process(pid: int, expected_start_time: Optional[str]) -> bool:
+    if not is_process_alive(pid):
+        return False
+    if expected_start_time is None:
+        # no start time stored - assume stale PID from before fix was deployed
+        # return False to force restart and get proper start_time tracking
+        return False
+    actual_start_time = get_process_start_time(pid)
+    if actual_start_time is None:
+        return False
+    return actual_start_time == expected_start_time
 
 
 # ##################################################################
@@ -333,11 +365,13 @@ def get_process_status(name: str) -> Optional[int]:
         return None
     if isinstance(process_state, int):
         pid = process_state
+        start_time = None
     else:
         pid = process_state.get("pid")
+        start_time = process_state.get("start_time")
     if pid is None:
         return None
-    if is_process_alive(pid):
+    if is_our_process(pid, start_time):
         return pid
     return None
 
@@ -375,6 +409,9 @@ def start_process(name: str) -> int:
     )
     log_file.close()
 
+    # get the start time of the new process for identity verification
+    start_time = get_process_start_time(process.pid)
+
     # update state, preserving existing restart_attempt and last_restart_time
     state = load_state()
     existing = state.get(name, {})
@@ -382,6 +419,7 @@ def start_process(name: str) -> int:
         existing = {"pid": existing, "explicitly_stopped": False, "restart_attempt": 0, "last_restart_time": None}
     state[name] = {
         "pid": process.pid,
+        "start_time": start_time,
         "explicitly_stopped": False,
         "restart_attempt": existing.get("restart_attempt", 0),
         "last_restart_time": existing.get("last_restart_time"),
@@ -677,8 +715,9 @@ def _generate_plist_content() -> str:
     run_script = project_root / "run"
     auto_log_path = get_auto_log_path()
 
-    # get current PATH from environment
+    # get current PATH and LANG from environment
     current_path = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+    current_lang = os.environ.get("LANG", "en_US.UTF-8")
 
     plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -703,6 +742,8 @@ def _generate_plist_content() -> str:
     <dict>
         <key>PATH</key>
         <string>{current_path}</string>
+        <key>LANG</key>
+        <string>{current_lang}</string>
     </dict>
 </dict>
 </plist>
