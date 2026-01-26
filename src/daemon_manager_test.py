@@ -184,14 +184,15 @@ def test_remove_process(temp_dir):
 
 # ##################################################################
 # test backward compatibility with old state format
-# ensures old integer pid format still works
+# ensures old integer pid format is treated as stale to force restart with proper tracking
 def test_backward_compatibility_with_old_state_format(temp_dir):
     dm.add_process("test", "sleep 100")
     pid = dm.start_process("test")
     state = dm.load_state()
-    state["test"] = pid
+    state["test"] = pid  # old format: just pid, no start_time
     dm.save_state(state)
-    assert dm.get_process_status("test") == pid
+    # old-style entries without start_time are treated as stale for PID reuse safety
+    assert dm.get_process_status("test") is None
     assert not dm.is_explicitly_stopped("test")
     os.kill(pid, signal.SIGTERM)
 
@@ -350,3 +351,55 @@ def test_wait_for_port_free_times_out_when_port_busy(temp_dir):
         assert not result
     finally:
         sock.close()
+
+
+# ##################################################################
+# test parse lstart time handles both locale formats
+# ensures we correctly parse US and AU/UK date formats from ps lstart
+def test_parse_lstart_time_handles_locale_formats(temp_dir):
+    # US format: "Mon Jan 26 10:35:12 2026"
+    us_time = dm._parse_lstart_time("Mon Jan 26 10:35:12 2026")
+    assert us_time is not None
+    assert us_time.day == 26
+    assert us_time.month == 1
+    assert us_time.year == 2026
+    assert us_time.hour == 10
+    assert us_time.minute == 35
+    assert us_time.second == 12
+
+    # AU/UK format: "Mon 26 Jan 10:35:12 2026"
+    au_time = dm._parse_lstart_time("Mon 26 Jan 10:35:12 2026")
+    assert au_time is not None
+    assert au_time.day == 26
+    assert au_time.month == 1
+    assert au_time.year == 2026
+
+    # Both should parse to the same datetime
+    assert us_time == au_time
+
+
+# ##################################################################
+# test is our process handles mismatched locale formats
+# ensures processes are recognized even with different date format in state vs ps output
+def test_is_our_process_handles_mismatched_locale_formats(temp_dir):
+    dm.add_process("test", "sleep 100")
+    pid = dm.start_process("test")
+
+    # get actual start time from ps
+    actual_start_time = dm.get_process_start_time(pid)
+    assert actual_start_time is not None
+
+    # convert to other locale format and verify it still matches
+    parsed = dm._parse_lstart_time(actual_start_time)
+    assert parsed is not None
+
+    # try US format
+    us_format = parsed.strftime("%a %b %d %H:%M:%S %Y")
+    # try AU format
+    au_format = parsed.strftime("%a %d %b %H:%M:%S %Y")
+
+    # regardless of which format ps returned, both formatted versions should work
+    assert dm.is_our_process(pid, us_format)
+    assert dm.is_our_process(pid, au_format)
+
+    os.kill(pid, signal.SIGTERM)

@@ -301,6 +301,27 @@ def is_process_alive(pid: int) -> bool:
 
 
 # ##################################################################
+# parse lstart time
+# parses the output of ps -o lstart= which varies by locale
+# US format: "Mon Jan 26 10:35:12 2026"
+# AU format: "Mon 26 Jan 10:57:01 2026"
+def _parse_lstart_time(time_str: str) -> Optional[datetime]:
+    if not time_str:
+        return None
+    # try US format first: "Mon Jan 26 10:35:12 2026"
+    try:
+        return datetime.strptime(time_str, "%a %b %d %H:%M:%S %Y")
+    except ValueError:
+        pass
+    # try AU/UK format: "Mon 26 Jan 10:57:01 2026"
+    try:
+        return datetime.strptime(time_str, "%a %d %b %H:%M:%S %Y")
+    except ValueError:
+        pass
+    return None
+
+
+# ##################################################################
 # is our process
 # checks if pid is alive AND matches the stored start time (handles PID reuse after reboot)
 def is_our_process(pid: int, expected_start_time: Optional[str]) -> bool:
@@ -313,7 +334,13 @@ def is_our_process(pid: int, expected_start_time: Optional[str]) -> bool:
     actual_start_time = get_process_start_time(pid)
     if actual_start_time is None:
         return False
-    return actual_start_time == expected_start_time
+    # parse both times and compare as datetime to handle locale differences
+    expected_dt = _parse_lstart_time(expected_start_time)
+    actual_dt = _parse_lstart_time(actual_start_time)
+    if expected_dt is None or actual_dt is None:
+        # fallback to exact string comparison if parsing fails
+        return actual_start_time == expected_start_time
+    return expected_dt == actual_dt
 
 
 # ##################################################################
