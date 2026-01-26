@@ -22,7 +22,8 @@ Processes are tracked by both `pid` AND `start_time` in state.json. This handles
 The plist at `~/Library/LaunchAgents/com.darrenoakey.auto.plist` must include `LANG` in EnvironmentVariables:
 - Without LANG, `ps -o lstart=` returns US format: `Mon Jan 26`
 - With `en_AU` locale, same command returns: `Mon 26 Jan`
-- Mismatch causes valid processes to be detected as stale
+- `_parse_lstart_time()` handles both formats, so mixed format entries in state.json work correctly
+- LANG should still be set consistently to avoid confusion when reading state.json manually
 
 ## Gotchas
 
