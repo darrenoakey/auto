@@ -25,6 +25,22 @@ The plist at `~/Library/LaunchAgents/com.darrenoakey.auto.plist` must include `L
 - `_parse_lstart_time()` handles both formats, so mixed format entries in state.json work correctly
 - LANG should still be set consistently to avoid confusion when reading state.json manually
 
+### SIGTERM Graceful Shutdown
+
+The watch loop (`command_watch`) registers a SIGTERM handler that raises `ShutdownRequested`:
+- During macOS system shutdown, SIGTERM is sent to all user processes
+- Without the handler, watch would detect dying managed processes and restart them, fighting the shutdown
+- The handler interrupts both `time.sleep()` and `watch_and_restart_processes()` mid-execution
+- On SIGTERM: stops the loop, calls `shutdown_all_processes()` (which does NOT mark processes as `explicitly_stopped`), exits cleanly
+- After reboot, processes will be auto-restarted by the watch loop since they aren't marked as explicitly stopped
+
+### Process Status Display
+
+`auto ps` shows three states for the PID column:
+- `<pid>` — process is running
+- `stopped` — user explicitly stopped it (`auto stop`), watch won't restart it
+- `dead` — process died unexpectedly, watch will restart it (with backoff)
+
 ## Gotchas
 
 ### "Process shows running but isn't responding"
