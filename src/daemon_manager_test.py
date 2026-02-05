@@ -403,3 +403,22 @@ def test_is_our_process_handles_mismatched_locale_formats(temp_dir):
     assert dm.is_our_process(pid, au_format)
 
     os.kill(pid, signal.SIGTERM)
+
+
+# ##################################################################
+# test list processes includes explicitly stopped flag
+# ensures list_processes returns explicitly_stopped for each process
+def test_list_processes_includes_explicitly_stopped(temp_dir):
+    dm.add_process("sleeper", "sleep 100")
+    pid = dm.start_process("sleeper")
+
+    # running process should not be explicitly stopped
+    processes = dm.list_processes()
+    assert processes["sleeper"]["explicitly_stopped"] is False
+
+    # stop process and verify flag changes
+    dm.stop_process("sleeper")
+    dm.wait_for_process_death(pid, timeout_seconds=2)
+    processes = dm.list_processes()
+    assert processes["sleeper"]["explicitly_stopped"] is True
+    assert processes["sleeper"]["pid"] is None

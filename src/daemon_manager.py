@@ -600,7 +600,8 @@ def list_processes() -> dict:
             "command": definition["command"],
             "pid": pid,
             "port": definition.get("port"),
-            "workdir": definition.get("workdir")
+            "workdir": definition.get("workdir"),
+            "explicitly_stopped": is_explicitly_stopped(name)
         }
     return result
 
