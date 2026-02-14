@@ -11,6 +11,14 @@ from typing import Optional
 
 
 # ##################################################################
+# constants
+# timeout values for process termination
+SIGTERM_TIMEOUT = 5.0  # seconds to wait before escalating to SIGKILL
+SIGKILL_TIMEOUT = 5.0  # seconds to wait after SIGKILL before giving up
+SUCCESSFUL_START_THRESHOLD = 60  # seconds of uptime to reset backoff
+
+
+# ##################################################################
 # get project root
 # finds the absolute path to the auto project directory
 def get_project_root() -> Path:
@@ -419,6 +427,15 @@ def start_process(name: str) -> int:
     process_config = config[name]
     command = process_config["command"]
     workdir = process_config.get("workdir")
+    port = process_config.get("port")
+
+    # check if port is free before starting
+    if port is not None and not is_port_free(port):
+        raise RuntimeError(
+            f"Cannot start {name}: port {port} is already in use. "
+            f"Check with: lsof -i :{port}"
+        )
+
     log_path = get_new_log_path(name)
 
     # open log file
@@ -473,6 +490,7 @@ def wait_for_process_death(pid: int, timeout_seconds: float = 10, poll_interval:
 # ##################################################################
 # stop process
 # sends sigterm to a running process and marks it as explicitly stopped
+# escalates to sigkill if process does not die within timeout
 def stop_process(name: str, mark_explicit: bool = True) -> None:
     pid = get_process_status(name)
     if pid is None:
@@ -485,6 +503,18 @@ def stop_process(name: str, mark_explicit: bool = True) -> None:
         os.killpg(pgid, signal.SIGTERM)
     except OSError as err:
         raise RuntimeError(f"Failed to stop process {name} with pid {pid}: {err}")
+
+    # wait for process to die after SIGTERM
+    if not wait_for_process_death(pid, timeout_seconds=SIGTERM_TIMEOUT):
+        # process survived SIGTERM - escalate to SIGKILL
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError as err:
+            raise RuntimeError(f"Failed to SIGKILL process {name} with pid {pid}: {err}")
+
+        # wait again after SIGKILL
+        if not wait_for_process_death(pid, timeout_seconds=SIGKILL_TIMEOUT):
+            raise RuntimeError(f"Process {name} with pid {pid} survived both SIGTERM and SIGKILL")
 
     if mark_explicit:
         # mark as explicitly stopped
@@ -689,11 +719,36 @@ def should_restart_process(name: str) -> bool:
 
 
 # ##################################################################
+# check and reset backoff
+# resets restart backoff if process has been running successfully
+def check_and_reset_backoff(name: str) -> None:
+    state = load_state()
+    process_state = state.get(name)
+    if not process_state or isinstance(process_state, int):
+        return
+
+    restart_attempt = process_state.get("restart_attempt", 0)
+    if restart_attempt == 0:
+        return
+
+    last_restart = process_state.get("last_restart_time")
+    if last_restart and (time.time() - last_restart) >= SUCCESSFUL_START_THRESHOLD:
+        process_state["restart_attempt"] = 0
+        process_state["last_restart_time"] = None
+        save_state(state)
+
+
+# ##################################################################
 # watch and restart processes
 # monitors all configured processes and restarts those that have died unexpectedly
 def watch_and_restart_processes() -> None:
     config = load_config()
     for name in config:
+        pid = get_process_status(name)
+        if pid is not None:
+            # process is running - check if we should reset backoff
+            check_and_reset_backoff(name)
+            continue
         if not should_restart_process(name):
             continue
         try:

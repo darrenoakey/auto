@@ -138,6 +138,7 @@ def command_restart(args: argparse.Namespace) -> int:
                 print(f"Waiting for port {port} to be free...")
                 if not dm.wait_for_port_free(port, timeout_seconds=10):
                     print(f"Error: Port {port} is still in use after timeout")
+                    print(f"Check what's using it: lsof -i :{port}")
                     return 1
 
         # start

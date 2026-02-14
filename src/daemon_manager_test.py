@@ -422,3 +422,69 @@ def test_list_processes_includes_explicitly_stopped(temp_dir):
     processes = dm.list_processes()
     assert processes["sleeper"]["explicitly_stopped"] is True
     assert processes["sleeper"]["pid"] is None
+
+
+# ##################################################################
+# test stop process escalates to sigkill
+# ensures processes that ignore SIGTERM get killed with SIGKILL
+def test_stop_process_escalates_to_sigkill(temp_dir):
+    # create a script that traps SIGTERM but responds to SIGKILL
+    script_path = temp_dir / "trap_sigterm.sh"
+    script_path.write_text("#!/bin/bash\ntrap '' TERM\nsleep 999\n")
+    script_path.chmod(0o755)
+
+    dm.add_process("stubborn", str(script_path))
+    pid = dm.start_process("stubborn")
+    time.sleep(0.2)
+    assert dm.is_process_alive(pid)
+
+    # stop should escalate to SIGKILL and succeed
+    dm.stop_process("stubborn")
+    assert not dm.is_process_alive(pid)
+
+
+# ##################################################################
+# test start process fails when port in use
+# ensures start_process raises error with clear message when port is occupied
+def test_start_process_fails_when_port_in_use(temp_dir):
+    import socket
+    # bind a port
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+
+    try:
+        dm.add_process("test", "sleep 100", port=port)
+        # should raise RuntimeError mentioning the port
+        with pytest.raises(RuntimeError, match=f"port {port} is already in use"):
+            dm.start_process("test")
+    finally:
+        sock.close()
+
+
+# ##################################################################
+# test backoff resets after successful run
+# ensures restart backoff is reset after process runs successfully for threshold time
+def test_backoff_resets_after_successful_run(temp_dir):
+    dm.add_process("test", "sleep 100")
+    pid = dm.start_process("test")
+
+    # simulate a restart with backoff
+    state = dm.load_state()
+    state["test"]["restart_attempt"] = 3
+    state["test"]["last_restart_time"] = time.time() - 61  # 61 seconds ago
+    dm.save_state(state)
+
+    # verify backoff is accumulated
+    assert dm.get_restart_backoff_seconds("test") == 8
+
+    # call check_and_reset_backoff - should reset because process has been running > 60s
+    dm.check_and_reset_backoff("test")
+
+    # verify backoff is reset
+    assert dm.get_restart_backoff_seconds("test") == 1
+    state = dm.load_state()
+    assert state["test"]["restart_attempt"] == 0
+    assert state["test"]["last_restart_time"] is None
+
+    os.kill(pid, signal.SIGKILL)
