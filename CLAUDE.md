@@ -52,3 +52,40 @@ The watch loop (`command_watch`) registers a SIGTERM handler that raises `Shutdo
 ### Port conflicts during restart
 
 When auto watch restarts a process that fails immediately (e.g., port conflict), the state is updated with the failed process's PID. If the original process is still running, this creates a mismatch. Solution: kill the old process and reset state, or let auto watch handle it with backoff.
+
+## Process Management Patterns
+
+### Process Group Killing
+
+Processes are started with `start_new_session=True` which creates a new process group:
+- This is critical for services like uvicorn that spawn worker/reloader subprocesses
+- When stopping, MUST use `os.killpg(pgid, signal)` to kill the entire group
+- Using `os.kill(pid, signal)` only kills the parent, leaving orphaned children
+- Get pgid with `os.getpgid(pid)` before sending signals
+
+### SIGTERM→SIGKILL Escalation
+
+`stop_process()` uses a two-stage termination pattern:
+1. Send SIGTERM to process group, wait 5 seconds (`SIGTERM_TIMEOUT`)
+2. If still alive, send SIGKILL to process group, wait 5 seconds (`SIGKILL_TIMEOUT`)
+3. If still alive after SIGKILL, raise RuntimeError
+
+This handles stubborn processes that trap SIGTERM (e.g., shell scripts with `trap '' TERM`).
+
+### Port Pre-flight Checks
+
+`start_process()` checks port availability BEFORE spawning subprocess:
+- Uses `is_port_free(port)` to attempt binding the port
+- If occupied, raises RuntimeError with clear message including `lsof -i :<port>` hint
+- Prevents crash loops when ports are stuck bound by zombie processes
+- Automatically inherited by watch loop restarts (no special handling needed)
+
+### Exponential Backoff with Stability Reset
+
+Restart backoff doubles with each failure (1s, 2s, 4s... up to 2 hours):
+- `restart_attempt` counter tracks consecutive failures
+- `last_restart_time` records when restart was attempted
+- `check_and_reset_backoff()` monitors process uptime
+- After 60 seconds of stable operation (`SUCCESSFUL_START_THRESHOLD`), backoff resets to 0
+- Prevents indefinite backoff accumulation for normally stable processes
+- Called every watch cycle for running processes
