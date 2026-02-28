@@ -80,6 +80,17 @@ This handles stubborn processes that trap SIGTERM (e.g., shell scripts with `tra
 - Prevents crash loops when ports are stuck bound by zombie processes
 - Automatically inherited by watch loop restarts (no special handling needed)
 
+### Reboot Shutdown (`auto shutdown`)
+
+`auto shutdown` is for cleanly stopping everything before a computer restart:
+1. Stops all managed processes via `shutdown_all_processes()` — does NOT mark as `explicitly_stopped`
+2. Uses `launchctl bootout gui/<uid> <plist>` to kill the auto watch daemon and prevent LaunchAgent from restarting it
+3. After reboot, LaunchAgent bootstraps the plist fresh (it stays in `~/Library/LaunchAgents/`)
+4. Watch daemon starts, sees all processes are dead and not explicitly stopped → restarts them all
+
+Key difference from `auto stop <name>`: `stop` marks `explicitly_stopped=True` so watch won't restart.
+`shutdown` leaves `explicitly_stopped=False` so everything recovers after reboot.
+
 ### Exponential Backoff with Stability Reset
 
 Restart backoff doubles with each failure (1s, 2s, 4s... up to 2 hours):

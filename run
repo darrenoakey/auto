@@ -132,14 +132,13 @@ def command_restart(args: argparse.Namespace) -> int:
                 return 1
             print(f"Stopped {name}")
 
-        # wait for port to be free if configured
-        if port is not None:
-            if not dm.is_port_free(port):
-                print(f"Waiting for port {port} to be free...")
-                if not dm.wait_for_port_free(port, timeout_seconds=10):
-                    print(f"Error: Port {port} is still in use after timeout")
-                    print(f"Check what's using it: lsof -i :{port}")
-                    return 1
+        # force-free port if configured - kill anything still holding it
+        if port is not None and not dm.is_port_free(port):
+            print(f"Force-freeing port {port}...")
+            if not dm.force_free_port(port, timeout_seconds=10):
+                print(f"Error: Port {port} is still in use after killing all holders")
+                print(f"Check what's using it: lsof -i :{port}")
+                return 1
 
         # start
         pid = dm.start_process(name)
@@ -174,7 +173,7 @@ def command_add(args: argparse.Namespace) -> int:
 def command_update(args: argparse.Namespace) -> int:
     name = args.name
     try:
-        dm.update_process(name, port=args.port, workdir=args.workdir)
+        dm.update_process(name, command=args.command, port=args.port, workdir=args.workdir)
         print(f"Updated {name}")
         return 0
     except Exception as err:
@@ -244,6 +243,24 @@ def command_start_all(args: argparse.Namespace) -> int:
 
 
 # ##################################################################
+# command restart all
+# restarts all dead processes that are not explicitly stopped, force-freeing ports
+def command_restart_all(args: argparse.Namespace) -> int:
+    results = dm.restart_dead_processes()
+    if not results:
+        print("No dead processes to restart")
+        return 0
+    errors = False
+    for name, result in sorted(results.items()):
+        if isinstance(result, int):
+            print(f"Restarted {name} with pid {result}")
+        else:
+            print(f"Failed to restart {name}: {result}")
+            errors = True
+    return 1 if errors else 0
+
+
+# ##################################################################
 # command watch
 # continuously monitors and restarts dead processes with exponential backoff
 def command_watch(args: argparse.Namespace) -> int:
@@ -264,6 +281,24 @@ def command_watch(args: argparse.Namespace) -> int:
         dm.shutdown_all_processes()
         print("Shutdown complete")
         return 0
+
+
+# ##################################################################
+# command shutdown
+# stops all managed processes and the auto daemon itself for computer reboot
+# does not mark processes as explicitly stopped so they restart automatically after reboot
+def command_shutdown(args: argparse.Namespace) -> int:
+    try:
+        config = dm.load_config()
+        running = sorted(name for name in config if dm.get_process_status(name) is not None)
+        if running:
+            print(f"Stopping {len(running)} managed process(es): {', '.join(running)}")
+        dm.shutdown_for_reboot()
+        print("Shutdown complete. Auto daemon stopped. Safe to reboot.")
+        return 0
+    except Exception as err:
+        print(f"Error: {err}")
+        return 1
 
 
 # ##################################################################
@@ -319,6 +354,7 @@ def main(argv: list[str]) -> int:
     # update command
     update_parser = subparsers.add_parser("update", help="Update settings for an existing process")
     update_parser.add_argument("name", help="Process name")
+    update_parser.add_argument("--command", help="New command to run")
     update_parser.add_argument("--port", type=int, help="Port the process listens on")
     update_parser.add_argument("--workdir", help="Working directory for the process")
     update_parser.set_defaults(func=command_update)
@@ -333,6 +369,11 @@ def main(argv: list[str]) -> int:
     show_parser.add_argument("name", help="Process name")
     show_parser.set_defaults(func=command_show)
 
+    # status command (alias for show)
+    status_parser = subparsers.add_parser("status", help="Show process status (alias for show)")
+    status_parser.add_argument("name", help="Process name")
+    status_parser.set_defaults(func=command_show)
+
     # log command
     log_parser = subparsers.add_parser("log", help="Show process log")
     log_parser.add_argument("name", help="Process name")
@@ -344,9 +385,17 @@ def main(argv: list[str]) -> int:
     start_all_parser = subparsers.add_parser("start-all", help="Start all configured processes")
     start_all_parser.set_defaults(func=command_start_all)
 
+    # restart-all command
+    restart_all_parser = subparsers.add_parser("restart-all", help="Restart all dead processes (force-frees ports)")
+    restart_all_parser.set_defaults(func=command_restart_all)
+
     # watch command
     watch_parser = subparsers.add_parser("watch", help="Monitor and restart dead processes")
     watch_parser.set_defaults(func=command_watch)
+
+    # shutdown command
+    shutdown_parser = subparsers.add_parser("shutdown", help="Stop all processes and auto daemon for reboot (restarts resume after next boot)")
+    shutdown_parser.set_defaults(func=command_shutdown)
 
     # install command
     install_parser = subparsers.add_parser("install", help="Install auto daemon and wrapper script")

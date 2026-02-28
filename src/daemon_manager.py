@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -365,6 +366,45 @@ def is_port_free(port: int) -> bool:
 
 
 # ##################################################################
+# kill port holders
+# finds all processes listening on a port via lsof and SIGKILL them
+def kill_port_holders(port: int) -> list[int]:
+    killed = []
+    try:
+        result = subprocess.run(
+            ["lsof", "-ti", f":{port}"],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return killed
+        pids = set()
+        for line in result.stdout.strip().split("\n"):
+            line = line.strip()
+            if line.isdigit():
+                pids.add(int(line))
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed.append(pid)
+            except OSError:
+                pass
+    except Exception:
+        pass
+    return killed
+
+
+# ##################################################################
+# force free port
+# kills everything on a port and waits until the port is actually free
+def force_free_port(port: int, timeout_seconds: float = 10) -> bool:
+    if is_port_free(port):
+        return True
+    kill_port_holders(port)
+    return wait_for_port_free(port, timeout_seconds=timeout_seconds)
+
+
+# ##################################################################
 # wait for port free
 # polls until a port is free or timeout is reached
 def wait_for_port_free(port: int, timeout_seconds: float = 10, poll_interval: float = 0.1) -> bool:
@@ -429,12 +469,21 @@ def start_process(name: str) -> int:
     workdir = process_config.get("workdir")
     port = process_config.get("port")
 
-    # check if port is free before starting
+    # force-free port before starting - kill anything holding it
     if port is not None and not is_port_free(port):
-        raise RuntimeError(
-            f"Cannot start {name}: port {port} is already in use. "
-            f"Check with: lsof -i :{port}"
-        )
+        killed = kill_port_holders(port)
+        if killed:
+            print(f"Killed port {port} holders {killed} before starting {name}")
+        if not wait_for_port_free(port, timeout_seconds=10):
+            # second attempt - some children may have respawned
+            killed2 = kill_port_holders(port)
+            if killed2:
+                print(f"Killed additional port {port} holders {killed2}")
+            if not wait_for_port_free(port, timeout_seconds=5):
+                raise RuntimeError(
+                    f"Cannot start {name}: port {port} still in use after killing all holders. "
+                    f"Check with: lsof -i :{port}"
+                )
 
     log_path = get_new_log_path(name)
 
@@ -516,6 +565,13 @@ def stop_process(name: str, mark_explicit: bool = True) -> None:
         if not wait_for_process_death(pid, timeout_seconds=SIGKILL_TIMEOUT):
             raise RuntimeError(f"Process {name} with pid {pid} survived both SIGTERM and SIGKILL")
 
+    # force-free the port if configured - catches orphaned children that escaped the process group
+    config = load_config()
+    port = config.get(name, {}).get("port")
+    if port is not None and not is_port_free(port):
+        if not force_free_port(port, timeout_seconds=5):
+            raise RuntimeError(f"Port {port} still in use after killing process {name} and all port holders")
+
     if mark_explicit:
         # mark as explicitly stopped
         state = load_state()
@@ -542,6 +598,58 @@ def shutdown_all_processes(timeout_seconds: int = 10) -> None:
                 print(f"Warning: process {name} did not die within timeout")
         except Exception as err:
             print(f"Failed to stop {name}: {err}")
+
+
+# ##################################################################
+# get auto daemon pid
+# returns the pid of the running auto watch daemon via launchctl, or none if not running
+def get_auto_daemon_pid() -> Optional[int]:
+    try:
+        result = subprocess.run(
+            ["launchctl", "list", "com.darrenoakey.auto"],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode != 0:
+            return None
+        match = re.search(r'"PID"\s*=\s*(\d+)', result.stdout)
+        if match:
+            return int(match.group(1))
+        return None
+    except Exception:
+        return None
+
+
+# ##################################################################
+# shutdown for reboot
+# stops all managed processes without marking them explicitly stopped, then kills the auto daemon
+# use before rebooting - after reboot the watch daemon will restart all processes automatically
+def shutdown_for_reboot() -> None:
+    # stop all managed processes first so the watch loop cannot restart them
+    # mark_explicit=False means processes are not marked as stopped, so they restart after reboot
+    shutdown_all_processes()
+
+    # get daemon pid so we can wait for it to die after bootout
+    daemon_pid = get_auto_daemon_pid()
+
+    # bootout the launchagent - removes it from current boot session and kills the watch daemon
+    # prevents launchd from restarting the watch daemon between now and the reboot
+    # the plist remains in ~/Library/LaunchAgents/ and will be bootstrapped automatically on next login
+    launch_agent_path = get_launch_agent_path()
+    if launch_agent_path.exists():
+        try:
+            subprocess.run(
+                ["launchctl", "bootout", f"gui/{os.getuid()}", str(launch_agent_path)],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+        except Exception:
+            pass
+
+    # wait for the daemon to finish dying
+    if daemon_pid is not None:
+        wait_for_process_death(daemon_pid, timeout_seconds=SIGTERM_TIMEOUT)
 
 
 # ##################################################################
@@ -575,10 +683,13 @@ def add_process(name: str, command: str, port: Optional[int] = None, workdir: Op
 # ##################################################################
 # update process
 # updates an existing process definition in config
-def update_process(name: str, port: Optional[int] = None, workdir: Optional[str] = None) -> None:
+def update_process(name: str, command: Optional[str] = None, port: Optional[int] = None, workdir: Optional[str] = None) -> None:
     config = load_config()
     if name not in config:
         raise ValueError(f"Process {name} not found in config")
+
+    if command is not None:
+        config[name]["command"] = command
 
     if port is not None:
         try:
@@ -752,6 +863,16 @@ def watch_and_restart_processes() -> None:
         if not should_restart_process(name):
             continue
         try:
+            # force-free port before restarting - orphaned children may still hold it
+            port = config[name].get("port")
+            if port is not None and not is_port_free(port):
+                killed = kill_port_holders(port)
+                if killed:
+                    print(f"Killed port {port} holders {killed} before restarting {name}")
+                if not wait_for_port_free(port, timeout_seconds=5):
+                    print(f"Port {port} still busy, skipping restart of {name}")
+                    increment_restart_attempt(name)
+                    continue
             increment_restart_attempt(name)
             pid = start_process(name)
             backoff = get_restart_backoff_seconds(name)
@@ -773,6 +894,35 @@ def start_all_processes() -> None:
             except Exception as err:
                 # log but continue with other processes
                 print(f"Failed to start {name}: {err}")
+
+
+# ##################################################################
+# restart dead processes
+# attempts to restart all processes that are dead (not explicitly stopped)
+# force-frees ports before starting, returns dict of name -> pid or error
+def restart_dead_processes() -> dict[str, int | str]:
+    config = load_config()
+    results = {}
+    for name in config:
+        pid = get_process_status(name)
+        if pid is not None:
+            continue
+        if is_explicitly_stopped(name):
+            continue
+        try:
+            port = config[name].get("port")
+            if port is not None and not is_port_free(port):
+                killed = kill_port_holders(port)
+                if killed:
+                    print(f"Killed port {port} holders {killed} before restarting {name}")
+                if not wait_for_port_free(port, timeout_seconds=5):
+                    results[name] = f"port {port} still in use"
+                    continue
+            pid = start_process(name)
+            results[name] = pid
+        except Exception as err:
+            results[name] = str(err)
+    return results
 
 
 # ##################################################################

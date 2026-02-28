@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import os
 import signal
+import socket
+import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
@@ -270,6 +272,17 @@ def test_update_process_port(temp_dir):
 
 
 # ##################################################################
+# test update process command
+# ensures we can update the command of an existing process
+def test_update_process_command(temp_dir):
+    dm.add_process("test", "echo hello")
+    assert dm.get_process_command("test") == "echo hello"
+
+    dm.update_process("test", command="echo goodbye")
+    assert dm.get_process_command("test") == "echo goodbye"
+
+
+# ##################################################################
 # test update process workdir
 # ensures we can update the workdir of an existing process
 def test_update_process_workdir(temp_dir):
@@ -444,22 +457,61 @@ def test_stop_process_escalates_to_sigkill(temp_dir):
 
 
 # ##################################################################
-# test start process fails when port in use
-# ensures start_process raises error with clear message when port is occupied
-def test_start_process_fails_when_port_in_use(temp_dir):
+# test start process force-frees port before starting
+# ensures start_process kills port holders and succeeds instead of failing
+def test_start_process_force_frees_port_before_starting(temp_dir):
     import socket
-    # bind a port
+    # get a free port
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
+    sock.close()
 
+    # spawn a separate process that holds the port (so kill_port_holders can kill it)
+    holder = subprocess.Popen(
+        ["python3", "-c",
+         f"import socket, time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('127.0.0.1', {port})); s.listen(1); time.sleep(300)"],
+        start_new_session=True
+    )
+    time.sleep(0.5)
+    assert not dm.is_port_free(port)
+
+    dm.add_process("test", "sleep 100", port=port)
+    # start_process should kill the holder and succeed
+    pid = dm.start_process("test")
+    assert pid is not None
+    assert dm.is_process_alive(pid)
+
+    # clean up
+    dm.stop_process("test")
     try:
-        dm.add_process("test", "sleep 100", port=port)
-        # should raise RuntimeError mentioning the port
-        with pytest.raises(RuntimeError, match=f"port {port} is already in use"):
-            dm.start_process("test")
-    finally:
-        sock.close()
+        holder.kill()
+        holder.wait(timeout=2)
+    except Exception:
+        pass
+
+
+# ##################################################################
+# test shutdown for reboot stops processes without marking explicitly stopped
+# ensures shutdown_for_reboot kills all processes but leaves them eligible for restart after reboot
+def test_shutdown_for_reboot_stops_processes_without_marking(temp_dir):
+    dm.add_process("sleeper1", "sleep 100")
+    dm.add_process("sleeper2", "sleep 100")
+    pid1 = dm.start_process("sleeper1")
+    pid2 = dm.start_process("sleeper2")
+
+    assert dm.is_process_alive(pid1)
+    assert dm.is_process_alive(pid2)
+
+    # shutdown_for_reboot also calls launchctl bootout which will fail silently in test
+    dm.shutdown_for_reboot()
+
+    assert dm.wait_for_process_death(pid1, timeout_seconds=5)
+    assert dm.wait_for_process_death(pid2, timeout_seconds=5)
+
+    # must NOT be marked as explicitly stopped - they must restart after reboot
+    assert not dm.is_explicitly_stopped("sleeper1")
+    assert not dm.is_explicitly_stopped("sleeper2")
 
 
 # ##################################################################
@@ -488,3 +540,139 @@ def test_backoff_resets_after_successful_run(temp_dir):
     assert state["test"]["last_restart_time"] is None
 
     os.kill(pid, signal.SIGKILL)
+
+
+# ##################################################################
+# test kill port holders kills process holding a port
+# ensures kill_port_holders finds and kills processes via lsof
+def test_kill_port_holders_kills_process_on_port(temp_dir):
+    # get a free port
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    # start a subprocess that holds the port
+    import subprocess
+    proc = subprocess.Popen(
+        ["python3", "-c", f"import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',{port})); s.listen(1); time.sleep(100)"],
+    )
+    time.sleep(0.3)
+
+    assert not dm.is_port_free(port)
+    killed = dm.kill_port_holders(port)
+    assert len(killed) > 0
+    dm.wait_for_port_free(port, timeout_seconds=2)
+    assert dm.is_port_free(port)
+    proc.wait(timeout=2)
+
+
+# ##################################################################
+# test kill port holders returns empty when port is free
+# ensures kill_port_holders is a no-op for unused ports
+def test_kill_port_holders_returns_empty_for_free_port(temp_dir):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    killed = dm.kill_port_holders(port)
+    assert killed == []
+
+
+# ##################################################################
+# test force free port kills holders and waits
+# ensures force_free_port returns True after killing port occupants
+def test_force_free_port_succeeds(temp_dir):
+    import subprocess
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    proc = subprocess.Popen(
+        ["python3", "-c", f"import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',{port})); s.listen(1); time.sleep(100)"],
+    )
+    time.sleep(0.3)
+
+    assert not dm.is_port_free(port)
+    result = dm.force_free_port(port, timeout_seconds=5)
+    assert result
+    assert dm.is_port_free(port)
+    proc.wait(timeout=2)
+
+
+# ##################################################################
+# test force free port returns true when already free
+# ensures force_free_port is a fast no-op for available ports
+def test_force_free_port_returns_true_when_already_free(temp_dir):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    assert dm.force_free_port(port)
+
+
+# ##################################################################
+# test stop process frees port from orphaned children
+# ensures stop_process kills orphaned children holding the port
+def test_stop_process_frees_port_from_orphaned_children(temp_dir):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    script = temp_dir / "spawner.sh"
+    script.write_text(f"""#!/bin/bash
+python3 -c "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',{port})); s.listen(1); time.sleep(100)" &
+sleep 100
+""")
+    script.chmod(0o755)
+
+    dm.add_process("spawner", str(script), port=port)
+    pid = dm.start_process("spawner")
+    # wait for the background child to actually bind the port (python startup is slow)
+    deadline = time.time() + 3
+    while dm.is_port_free(port) and time.time() < deadline:
+        time.sleep(0.1)
+    assert not dm.is_port_free(port), f"Child never bound port {port}"
+    dm.stop_process("spawner")
+    assert dm.is_port_free(port)
+
+
+# ##################################################################
+# test restart dead processes restarts dead but not stopped or running
+# ensures restart_dead_processes only restarts processes that died unexpectedly
+def test_restart_dead_processes(temp_dir):
+    dm.add_process("alive", "sleep 100")
+    dm.add_process("dead", "sleep 100")
+    dm.add_process("stopped", "sleep 100")
+
+    # start all three
+    pid_alive = dm.start_process("alive")
+    pid_dead = dm.start_process("dead")
+    pid_stopped = dm.start_process("stopped")
+
+    # kill "dead" without marking explicitly stopped
+    os.kill(pid_dead, signal.SIGKILL)
+    dm.wait_for_process_death(pid_dead, timeout_seconds=2)
+
+    # stop "stopped" explicitly
+    dm.stop_process("stopped")
+
+    results = dm.restart_dead_processes()
+
+    # only "dead" should have been restarted
+    assert "dead" in results
+    assert isinstance(results["dead"], int)
+    assert "alive" not in results
+    assert "stopped" not in results
+
+    # verify "dead" is now running again
+    new_pid = dm.get_process_status("dead")
+    assert new_pid is not None
+    assert new_pid != pid_dead
+
+    # cleanup
+    os.kill(pid_alive, signal.SIGKILL)
+    os.kill(new_pid, signal.SIGKILL)
