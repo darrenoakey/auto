@@ -51,7 +51,11 @@ The watch loop (`command_watch`) registers a SIGTERM handler that raises `Shutdo
 
 ### Port conflicts during restart
 
-When auto watch restarts a process that fails immediately (e.g., port conflict), the state is updated with the failed process's PID. If the original process is still running, this creates a mismatch. Solution: kill the old process and reset state, or let auto watch handle it with backoff.
+Largely resolved by aggressive port clearing — `start_process()`, `command_restart`, and watch loop all force-free ports before starting. If port is still occupied after two kill rounds, RuntimeError is raised with `lsof` hint.
+
+### `auto update --command`
+
+`auto update <name> --command "new cmd"` changes the command for an existing service. Also supports `--port` and `--workdir`. Does NOT automatically restart — use `auto restart <name>` after updating.
 
 ## Process Management Patterns
 
@@ -72,13 +76,14 @@ Processes are started with `start_new_session=True` which creates a new process 
 
 This handles stubborn processes that trap SIGTERM (e.g., shell scripts with `trap '' TERM`).
 
-### Port Pre-flight Checks
+### Aggressive Port Clearing
 
-`start_process()` checks port availability BEFORE spawning subprocess:
-- Uses `is_port_free(port)` to attempt binding the port
-- If occupied, raises RuntimeError with clear message including `lsof -i :<port>` hint
-- Prevents crash loops when ports are stuck bound by zombie processes
-- Automatically inherited by watch loop restarts (no special handling needed)
+`start_process()` force-frees the port BEFORE spawning subprocess:
+- If port is occupied, calls `kill_port_holders()` via `lsof` to SIGKILL everything on that port
+- Waits for port to free, retries kill once if children respawned
+- Only raises RuntimeError if port is STILL occupied after two kill rounds
+- `command_restart` also uses `force_free_port()` between stop and start
+- Watch loop restarts do the same — no port conflicts survive
 
 ### Reboot Shutdown (`auto shutdown`)
 
