@@ -49,6 +49,10 @@ The watch loop (`command_watch`) registers a SIGTERM handler that raises `Shutdo
 2. After reboot, PIDs get reused - state.json may have stale entries
 3. Use `lsof -i :<port>` to find what's actually listening
 
+### Banner Auto-Suppression
+
+The banner is automatically suppressed when AI agent env vars are detected (`CLAUDECODE`, `CODEX_SANDBOX`, `GEMINI_CLI`). Use `--banner` to force it on, `-q` to explicitly suppress.
+
 ### Port conflicts during restart
 
 Largely resolved by aggressive port clearing — `start_process()`, `command_restart`, and watch loop all force-free ports before starting. If port is still occupied after two kill rounds, RuntimeError is raised with `lsof` hint.
@@ -78,12 +82,11 @@ This handles stubborn processes that trap SIGTERM (e.g., shell scripts with `tra
 
 ### Aggressive Port Clearing
 
-`start_process()` force-frees the port BEFORE spawning subprocess:
-- If port is occupied, calls `kill_port_holders()` via `lsof` to SIGKILL everything on that port
-- Waits for port to free, retries kill once if children respawned
-- Only raises RuntimeError if port is STILL occupied after two kill rounds
-- `command_restart` also uses `force_free_port()` between stop and start
-- Watch loop restarts do the same — no port conflicts survive
+`start_process()` calls `force_free_port()` BEFORE spawning subprocess:
+- `kill_port_holders()` finds PIDs via `lsof` and kills their **process groups** (`os.killpg`)
+- `force_free_port()` retries up to 5 times (kill → wait 2s → repeat)
+- `stop_process()` port cleanup is best-effort (no raise) — `start_process` is the final gate
+- All port freeing is centralized in `start_process` — watch loop and restart-all just call it
 
 ### Reboot Shutdown (`auto shutdown`)
 
