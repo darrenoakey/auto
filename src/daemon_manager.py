@@ -367,7 +367,7 @@ def is_port_free(port: int) -> bool:
 
 # ##################################################################
 # kill port holders
-# finds all processes listening on a port via lsof and SIGKILL them
+# finds all processes on a port via lsof, kills their process groups with SIGKILL
 def kill_port_holders(port: int) -> list[int]:
     killed = []
     try:
@@ -384,11 +384,18 @@ def kill_port_holders(port: int) -> list[int]:
             if line.isdigit():
                 pids.add(int(line))
         for pid in pids:
+            # try to kill the entire process group first
             try:
-                os.kill(pid, signal.SIGKILL)
+                pgid = os.getpgid(pid)
+                os.killpg(pgid, signal.SIGKILL)
                 killed.append(pid)
             except OSError:
-                pass
+                # fallback to killing just the pid
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    killed.append(pid)
+                except OSError:
+                    pass
     except Exception:
         pass
     return killed
@@ -396,12 +403,15 @@ def kill_port_holders(port: int) -> list[int]:
 
 # ##################################################################
 # force free port
-# kills everything on a port and waits until the port is actually free
-def force_free_port(port: int, timeout_seconds: float = 10) -> bool:
-    if is_port_free(port):
-        return True
-    kill_port_holders(port)
-    return wait_for_port_free(port, timeout_seconds=timeout_seconds)
+# repeatedly kills everything on a port until it's free or max attempts exhausted
+def force_free_port(port: int, max_attempts: int = 5, wait_per_attempt: float = 2.0) -> bool:
+    for _ in range(max_attempts):
+        if is_port_free(port):
+            return True
+        kill_port_holders(port)
+        if wait_for_port_free(port, timeout_seconds=wait_per_attempt):
+            return True
+    return is_port_free(port)
 
 
 # ##################################################################
@@ -469,21 +479,13 @@ def start_process(name: str) -> int:
     workdir = process_config.get("workdir")
     port = process_config.get("port")
 
-    # force-free port before starting - kill anything holding it
+    # force-free port before starting - obliterate anything holding it
     if port is not None and not is_port_free(port):
-        killed = kill_port_holders(port)
-        if killed:
-            print(f"Killed port {port} holders {killed} before starting {name}")
-        if not wait_for_port_free(port, timeout_seconds=10):
-            # second attempt - some children may have respawned
-            killed2 = kill_port_holders(port)
-            if killed2:
-                print(f"Killed additional port {port} holders {killed2}")
-            if not wait_for_port_free(port, timeout_seconds=5):
-                raise RuntimeError(
-                    f"Cannot start {name}: port {port} still in use after killing all holders. "
-                    f"Check with: lsof -i :{port}"
-                )
+        if not force_free_port(port):
+            raise RuntimeError(
+                f"Cannot start {name}: port {port} still in use after killing all holders. "
+                f"Check with: lsof -i :{port}"
+            )
 
     log_path = get_new_log_path(name)
 
@@ -566,11 +568,11 @@ def stop_process(name: str, mark_explicit: bool = True) -> None:
             raise RuntimeError(f"Process {name} with pid {pid} survived both SIGTERM and SIGKILL")
 
     # force-free the port if configured - catches orphaned children that escaped the process group
+    # best-effort: don't raise here, start_process will force-free again before launching
     config = load_config()
     port = config.get(name, {}).get("port")
     if port is not None and not is_port_free(port):
-        if not force_free_port(port, timeout_seconds=5):
-            raise RuntimeError(f"Port {port} still in use after killing process {name} and all port holders")
+        force_free_port(port)
 
     if mark_explicit:
         # mark as explicitly stopped
@@ -863,16 +865,6 @@ def watch_and_restart_processes() -> None:
         if not should_restart_process(name):
             continue
         try:
-            # force-free port before restarting - orphaned children may still hold it
-            port = config[name].get("port")
-            if port is not None and not is_port_free(port):
-                killed = kill_port_holders(port)
-                if killed:
-                    print(f"Killed port {port} holders {killed} before restarting {name}")
-                if not wait_for_port_free(port, timeout_seconds=5):
-                    print(f"Port {port} still busy, skipping restart of {name}")
-                    increment_restart_attempt(name)
-                    continue
             increment_restart_attempt(name)
             pid = start_process(name)
             backoff = get_restart_backoff_seconds(name)
@@ -910,14 +902,6 @@ def restart_dead_processes() -> dict[str, int | str]:
         if is_explicitly_stopped(name):
             continue
         try:
-            port = config[name].get("port")
-            if port is not None and not is_port_free(port):
-                killed = kill_port_holders(port)
-                if killed:
-                    print(f"Killed port {port} holders {killed} before restarting {name}")
-                if not wait_for_port_free(port, timeout_seconds=5):
-                    results[name] = f"port {port} still in use"
-                    continue
             pid = start_process(name)
             results[name] = pid
         except Exception as err:

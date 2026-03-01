@@ -552,10 +552,10 @@ def test_kill_port_holders_kills_process_on_port(temp_dir):
     port = sock.getsockname()[1]
     sock.close()
 
-    # start a subprocess that holds the port
-    import subprocess
+    # start a subprocess in its own session so killpg doesn't hit the test runner
     proc = subprocess.Popen(
         ["python3", "-c", f"import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',{port})); s.listen(1); time.sleep(100)"],
+        start_new_session=True,
     )
     time.sleep(0.3)
 
@@ -583,7 +583,6 @@ def test_kill_port_holders_returns_empty_for_free_port(temp_dir):
 # test force free port kills holders and waits
 # ensures force_free_port returns True after killing port occupants
 def test_force_free_port_succeeds(temp_dir):
-    import subprocess
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("127.0.0.1", 0))
@@ -592,11 +591,12 @@ def test_force_free_port_succeeds(temp_dir):
 
     proc = subprocess.Popen(
         ["python3", "-c", f"import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',{port})); s.listen(1); time.sleep(100)"],
+        start_new_session=True,
     )
     time.sleep(0.3)
 
     assert not dm.is_port_free(port)
-    result = dm.force_free_port(port, timeout_seconds=5)
+    result = dm.force_free_port(port)
     assert result
     assert dm.is_port_free(port)
     proc.wait(timeout=2)
