@@ -515,6 +515,59 @@ def test_shutdown_for_reboot_stops_processes_without_marking(temp_dir):
 
 
 # ##################################################################
+# test shutdown all processes kills in parallel not sequentially
+# ensures multiple processes are killed concurrently (total time < sum of individual timeouts)
+def test_shutdown_all_processes_kills_in_parallel(temp_dir):
+    # start several processes
+    for i in range(5):
+        dm.add_process(f"par{i}", "sleep 100")
+        dm.start_process(f"par{i}")
+
+    start = time.monotonic()
+    dm.shutdown_all_processes()
+    elapsed = time.monotonic() - start
+
+    # if sequential with 5s SIGTERM timeout each, this would take 25s+
+    # parallel should complete well under 10s
+    assert elapsed < 10, f"shutdown_all_processes took {elapsed:.1f}s — not parallel?"
+
+    # all should be dead
+    for i in range(5):
+        assert dm.get_process_status(f"par{i}") is None
+
+
+# ##################################################################
+# test shutdown for reboot kills daemon before processes
+# ensures the watch daemon is bootout'd before process killing begins
+def test_shutdown_for_reboot_kills_daemon_first(temp_dir, monkeypatch):
+    call_order = []
+
+    original_shutdown_all = dm.shutdown_all_processes
+    original_subprocess_run = subprocess.run
+
+    def track_subprocess_run(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and "launchctl" in cmd:
+            call_order.append("bootout")
+            return subprocess.CompletedProcess(args=cmd, returncode=0)
+        return original_subprocess_run(cmd, *args, **kwargs)
+
+    def track_shutdown_all(*args, **kwargs):
+        call_order.append("shutdown_all")
+        original_shutdown_all(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", track_subprocess_run)
+    monkeypatch.setattr(dm, "shutdown_all_processes", track_shutdown_all)
+    monkeypatch.setattr(dm, "get_auto_daemon_pid", lambda: None)
+
+    dm.add_process("sleeper", "sleep 100")
+    dm.start_process("sleeper")
+
+    dm.shutdown_for_reboot()
+
+    assert call_order.index("bootout") < call_order.index("shutdown_all")
+
+
+# ##################################################################
 # test backoff resets after successful run
 # ensures restart backoff is reset after process runs successfully for threshold time
 def test_backoff_resets_after_successful_run(temp_dir):
@@ -676,3 +729,170 @@ def test_restart_dead_processes(temp_dir):
     # cleanup
     os.kill(pid_alive, signal.SIGKILL)
     os.kill(new_pid, signal.SIGKILL)
+
+
+# ##################################################################
+# test parse interval
+# ensures various human-readable interval strings are parsed correctly
+def test_parse_interval():
+    assert dm.parse_interval("30m") == 1800
+    assert dm.parse_interval("24h") == 86400
+    assert dm.parse_interval("1d") == 86400
+    assert dm.parse_interval("7d") == 604800
+    assert dm.parse_interval("90s") == 90
+    assert dm.parse_interval("3600") == 3600
+    assert dm.parse_interval("0.5h") == 1800
+    with pytest.raises(ValueError):
+        dm.parse_interval("")
+    with pytest.raises(ValueError):
+        dm.parse_interval("abc")
+
+
+# ##################################################################
+# test format interval
+# ensures seconds are formatted back to human-readable strings
+def test_format_interval():
+    assert dm.format_interval(86400) == "1d"
+    assert dm.format_interval(172800) == "2d"
+    assert dm.format_interval(3600) == "1h"
+    assert dm.format_interval(7200) == "2h"
+    assert dm.format_interval(1800) == "30m"
+    assert dm.format_interval(60) == "1m"
+    assert dm.format_interval(45) == "45s"
+    assert dm.format_interval(90) == "90s"
+
+
+# ##################################################################
+# test set and get restart interval
+# ensures restart interval can be stored and retrieved for a process
+def test_set_and_get_restart_interval(temp_dir):
+    dm.add_process("test1", "sleep 100")
+    assert dm.get_restart_interval("test1") is None
+    dm.set_restart_interval("test1", 86400)
+    assert dm.get_restart_interval("test1") == 86400
+    # clear it
+    dm.set_restart_interval("test1", None)
+    assert dm.get_restart_interval("test1") is None
+
+
+# ##################################################################
+# test needs periodic restart false when no interval set
+# ensures processes without a restart interval never trigger periodic restart
+def test_needs_periodic_restart_no_interval(temp_dir):
+    dm.add_process("test1", "sleep 100")
+    pid = dm.start_process("test1")
+    assert not dm.needs_periodic_restart("test1")
+    os.kill(pid, signal.SIGKILL)
+
+
+# ##################################################################
+# test needs periodic restart true when interval elapsed
+# ensures periodic restart triggers after the configured interval
+def test_needs_periodic_restart_elapsed(temp_dir):
+    dm.add_process("test1", "sleep 100")
+    pid = dm.start_process("test1")
+    dm.set_restart_interval("test1", 60)
+    # set last_periodic_restart to 120 seconds ago
+    state = dm.load_state()
+    state["test1"]["last_periodic_restart"] = time.time() - 120
+    dm.save_state(state)
+    assert dm.needs_periodic_restart("test1")
+    os.kill(pid, signal.SIGKILL)
+
+
+# ##################################################################
+# test needs periodic restart false when interval not elapsed
+# ensures periodic restart does not trigger before the interval
+def test_needs_periodic_restart_not_elapsed(temp_dir):
+    dm.add_process("test1", "sleep 100")
+    pid = dm.start_process("test1")
+    dm.set_restart_interval("test1", 86400)
+    # last_periodic_restart is set to now by set_restart_interval
+    assert not dm.needs_periodic_restart("test1")
+    os.kill(pid, signal.SIGKILL)
+
+
+# ##################################################################
+# test perform periodic restart
+# ensures a running process is restarted and timestamp is updated
+def test_perform_periodic_restart(temp_dir):
+    dm.add_process("test1", "sleep 100")
+    old_pid = dm.start_process("test1")
+    dm.set_restart_interval("test1", 60)
+    before = time.time()
+    new_pid = dm.perform_periodic_restart("test1")
+    assert new_pid is not None
+    assert new_pid != old_pid
+    # old pid should be dead
+    assert not dm.is_process_alive(old_pid)
+    # new pid should be alive
+    assert dm.is_process_alive(new_pid)
+    # last_periodic_restart should be updated
+    state = dm.load_state()
+    assert state["test1"]["last_periodic_restart"] >= before
+    # cleanup
+    os.kill(new_pid, signal.SIGKILL)
+
+
+# ##################################################################
+# test restart interval preserved across start
+# ensures the restart interval survives a process restart
+def test_restart_interval_preserved_across_start(temp_dir):
+    dm.add_process("test1", "sleep 100")
+    dm.set_restart_interval("test1", 86400)
+    pid = dm.start_process("test1")
+    assert dm.get_restart_interval("test1") == 86400
+    dm.stop_process("test1")
+    dm.wait_for_process_death(pid, timeout_seconds=5)
+    # interval should still be set after stop + re-read
+    assert dm.get_restart_interval("test1") == 86400
+
+
+# ##################################################################
+# test load state file resilient to empty file
+# ensures the daemon doesn't crash when state.json is empty
+def test_load_state_file_empty(temp_dir):
+    state_path = dm.get_state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text("")
+    state = dm._load_state_file()
+    assert state == {"processes": {}}
+
+
+# ##################################################################
+# test load state file resilient to corrupt json
+# ensures the daemon doesn't crash when state.json contains garbage
+def test_load_state_file_corrupt(temp_dir):
+    state_path = dm.get_state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text("{corrupt json!!!")
+    state = dm._load_state_file()
+    assert state == {"processes": {}}
+
+
+# ##################################################################
+# test load state file restores from backup on corruption
+# ensures the backup is used when state.json is corrupt
+def test_load_state_file_restores_backup(temp_dir):
+    dm.add_process("myservice", "sleep 100")
+    # corrupt the main file but leave backup intact
+    state_path = dm.get_state_path()
+    backup_path = state_path.with_suffix(".json.bak")
+    assert backup_path.exists(), "backup should exist after save"
+    state_path.write_text("")
+    state = dm._load_state_file()
+    assert "myservice" in state.get("processes", {})
+
+
+# ##################################################################
+# test save state file is atomic
+# ensures a backup file is created alongside the state file
+def test_save_state_file_creates_backup(temp_dir):
+    dm.add_process("myservice", "sleep 100")
+    state_path = dm.get_state_path()
+    backup_path = state_path.with_suffix(".json.bak")
+    assert state_path.exists()
+    assert backup_path.exists()
+    import json
+    backup_data = json.loads(backup_path.read_text())
+    assert "myservice" in backup_data.get("processes", {})

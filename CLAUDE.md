@@ -91,10 +91,10 @@ This handles stubborn processes that trap SIGTERM (e.g., shell scripts with `tra
 ### Reboot Shutdown (`auto shutdown`)
 
 `auto shutdown` is for cleanly stopping everything before a computer restart:
-1. Stops all managed processes via `shutdown_all_processes()` — does NOT mark as `explicitly_stopped`
-2. Uses `launchctl bootout gui/<uid> <plist>` to kill the auto watch daemon and prevent LaunchAgent from restarting it
-3. After reboot, LaunchAgent bootstraps the plist fresh (it stays in `~/Library/LaunchAgents/`)
-4. Watch daemon starts, sees all processes are dead and not explicitly stopped → restarts them all
+1. **Kills the watch daemon FIRST** via `launchctl bootout` — prevents it from restarting processes during shutdown
+2. SIGTERMs all managed process groups **in parallel** (not sequentially) — fast teardown
+3. Any survivors after 5s get SIGKILLed in parallel
+4. Does NOT mark as `explicitly_stopped` — after reboot, watch daemon restarts them all
 
 Key difference from `auto stop <name>`: `stop` marks `explicitly_stopped=True` so watch won't restart.
 `shutdown` leaves `explicitly_stopped=False` so everything recovers after reboot.
@@ -108,3 +108,22 @@ Restart backoff doubles with each failure (1s, 2s, 4s... up to 2 hours):
 - After 60 seconds of stable operation (`SUCCESSFUL_START_THRESHOLD`), backoff resets to 0
 - Prevents indefinite backoff accumulation for normally stable processes
 - Called every watch cycle for running processes
+
+### Periodic Restarts
+
+Processes can be configured for scheduled periodic restarts:
+- `auto update <name> --restart-every 24h` sets a daily restart schedule
+- `auto update <name> --restart-every off` disables periodic restart
+- Also available on `auto add --restart-every`
+- State fields: `restart_interval_seconds` (int) and `last_periodic_restart` (unix timestamp)
+- Watch loop checks running processes each cycle; when elapsed time >= interval, performs graceful restart
+- `perform_periodic_restart()` does stop (mark_explicit=False) → force-free port → start → update timestamp
+- `auto ps` shows the RESTART column with the interval (e.g. `1d`, `12h`, `30m`) or `-` if none
+- Interval format: `30m`, `12h`, `24h`, `7d`, `90s`, or raw seconds
+
+### Restarting Auto Itself
+
+The auto watch daemon runs as a LaunchAgent with `KeepAlive=true`. To restart it without affecting managed processes:
+- `launchctl kickstart -k "gui/$(id -u)/com.darrenoakey.auto"` — kills and restarts the watch loop
+- Or `./run install` — reinstalls the plist and reloads the LaunchAgent
+- Managed processes are untouched because only the watch loop is restarted

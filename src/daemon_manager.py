@@ -18,6 +18,9 @@ SIGTERM_TIMEOUT = 5.0  # seconds to wait before escalating to SIGKILL
 SIGKILL_TIMEOUT = 5.0  # seconds to wait after SIGKILL before giving up
 SUCCESSFUL_START_THRESHOLD = 60  # seconds of uptime to reset backoff
 
+# human-readable interval suffixes for restart_every parsing
+INTERVAL_SUFFIXES = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
 
 # ##################################################################
 # get project root
@@ -147,25 +150,53 @@ def get_latest_log_path(name: str) -> Optional[Path]:
 # ##################################################################
 # load state file
 # reads the entire state file from disk or returns empty dict with processes key
+# resilient to corrupt/empty JSON - logs warning and returns empty state rather than crashing
 def _load_state_file() -> dict:
     state_path = get_state_path()
     if not state_path.exists():
         return {"processes": {}}
-    with open(state_path, "r") as f:
-        data = json.load(f)
+    try:
+        text = state_path.read_text()
+        if not text.strip():
+            raise ValueError("empty file")
+        data = json.loads(text)
         if "processes" not in data:
             data["processes"] = {}
         return data
+    except (json.JSONDecodeError, ValueError) as err:
+        # corrupt or empty state file - try the backup
+        backup_path = state_path.with_suffix(".json.bak")
+        if backup_path.exists():
+            try:
+                backup_text = backup_path.read_text()
+                if backup_text.strip():
+                    data = json.loads(backup_text)
+                    if "processes" not in data:
+                        data["processes"] = {}
+                    print(f"Warning: {state_path} corrupt ({err}), restored from backup")
+                    # restore the good backup over the corrupt file
+                    _save_state_file(data)
+                    return data
+            except (json.JSONDecodeError, ValueError):
+                pass
+        print(f"Warning: {state_path} corrupt ({err}), no valid backup, treating as fresh state")
+        return {"processes": {}}
 
 
 # ##################################################################
 # save state file
-# writes the entire state file to disk
+# writes the entire state file to disk using atomic write (write to temp, then rename)
+# this prevents corruption from concurrent reads or crashes mid-write
 def _save_state_file(state_data: dict) -> None:
     state_path = get_state_path()
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(state_path, "w") as f:
-        json.dump(state_data, f, indent=2)
+    # atomic write: write to temp file then rename
+    tmp_path = state_path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(state_data, indent=2))
+    tmp_path.rename(state_path)
+    # keep a backup for recovery from corruption
+    backup_path = state_path.with_suffix(".json.bak")
+    backup_path.write_text(json.dumps(state_data, indent=2))
 
 
 # ##################################################################
@@ -240,7 +271,7 @@ def save_state(state: dict) -> None:
     state_data = _load_state_file()
     if "processes" not in state_data:
         state_data["processes"] = {}
-    preserved_fields = ["command", "port", "workdir", "log_path"]
+    preserved_fields = ["command", "port", "workdir", "log_path", "restart_interval_seconds", "last_periodic_restart"]
     for name, process_state in state.items():
         if name not in state_data["processes"]:
             state_data["processes"][name] = process_state
@@ -587,19 +618,53 @@ def stop_process(name: str, mark_explicit: bool = True) -> None:
 
 # ##################################################################
 # shutdown all processes
-# stops all running processes without marking them explicitly stopped
-def shutdown_all_processes(timeout_seconds: int = 10) -> None:
+# stops all running processes in parallel without marking them explicitly stopped
+def shutdown_all_processes(timeout_seconds: float = SIGTERM_TIMEOUT) -> None:
     config = load_config()
+
+    # collect all running processes with their pgids
+    targets: list[tuple[str, int, int]] = []  # (name, pid, pgid)
     for name in config:
         pid = get_process_status(name)
         if pid is None:
             continue
         try:
-            stop_process(name, mark_explicit=False)
-            if not wait_for_process_death(pid, timeout_seconds=timeout_seconds):
-                print(f"Warning: process {name} did not die within timeout")
-        except Exception as err:
-            print(f"Failed to stop {name}: {err}")
+            pgid = os.getpgid(pid)
+            targets.append((name, pid, pgid))
+        except OSError:
+            continue
+
+    if not targets:
+        return
+
+    # SIGTERM all process groups at once
+    for name, pid, pgid in targets:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except OSError:
+            pass
+
+    # wait for all to die (single shared timeout)
+    deadline = time.monotonic() + timeout_seconds
+    alive = list(targets)
+    while alive and time.monotonic() < deadline:
+        time.sleep(0.1)
+        alive = [(n, p, g) for n, p, g in alive if is_process_alive(p)]
+
+    # SIGKILL any survivors
+    if alive:
+        for name, pid, pgid in alive:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except OSError:
+                pass
+        # brief wait for SIGKILL to take effect
+        kill_deadline = time.monotonic() + 2.0
+        while alive and time.monotonic() < kill_deadline:
+            time.sleep(0.1)
+            alive = [(n, p, g) for n, p, g in alive if is_process_alive(p)]
+        for name, pid, _ in alive:
+            print(f"Warning: process {name} (pid {pid}) survived SIGKILL")
 
 
 # ##################################################################
@@ -624,19 +689,11 @@ def get_auto_daemon_pid() -> Optional[int]:
 
 # ##################################################################
 # shutdown for reboot
-# stops all managed processes without marking them explicitly stopped, then kills the auto daemon
-# use before rebooting - after reboot the watch daemon will restart all processes automatically
+# kills the watch daemon FIRST (so it can't restart anything), then obliterates all processes in parallel
+# does not mark processes as explicitly stopped so they restart after reboot
 def shutdown_for_reboot() -> None:
-    # stop all managed processes first so the watch loop cannot restart them
-    # mark_explicit=False means processes are not marked as stopped, so they restart after reboot
-    shutdown_all_processes()
-
-    # get daemon pid so we can wait for it to die after bootout
+    # 1. kill the watch daemon FIRST to prevent it from restarting processes we're about to kill
     daemon_pid = get_auto_daemon_pid()
-
-    # bootout the launchagent - removes it from current boot session and kills the watch daemon
-    # prevents launchd from restarting the watch daemon between now and the reboot
-    # the plist remains in ~/Library/LaunchAgents/ and will be bootstrapped automatically on next login
     launch_agent_path = get_launch_agent_path()
     if launch_agent_path.exists():
         try:
@@ -648,10 +705,11 @@ def shutdown_for_reboot() -> None:
             )
         except Exception:
             pass
-
-    # wait for the daemon to finish dying
     if daemon_pid is not None:
         wait_for_process_death(daemon_pid, timeout_seconds=SIGTERM_TIMEOUT)
+
+    # 2. now obliterate all managed processes in parallel
+    shutdown_all_processes()
 
 
 # ##################################################################
@@ -815,6 +873,127 @@ def reset_restart_attempt(name: str) -> None:
 
 
 # ##################################################################
+# parse interval
+# converts a human-readable interval string like "24h", "30m", "7d" to seconds
+def parse_interval(interval_str: str) -> int:
+    interval_str = interval_str.strip().lower()
+    if not interval_str:
+        raise ValueError("Empty interval string")
+    suffix = interval_str[-1]
+    if suffix in INTERVAL_SUFFIXES:
+        try:
+            value = float(interval_str[:-1])
+        except ValueError:
+            raise ValueError(f"Invalid interval: {interval_str}")
+        return int(value * INTERVAL_SUFFIXES[suffix])
+    # no suffix = seconds
+    try:
+        return int(interval_str)
+    except ValueError:
+        raise ValueError(f"Invalid interval: {interval_str}. Use e.g. 30m, 12h, 1d")
+
+
+# ##################################################################
+# format interval
+# converts seconds to a human-readable string like "24h", "30m", "7d"
+def format_interval(seconds: int) -> str:
+    if seconds >= 86400 and seconds % 86400 == 0:
+        return f"{seconds // 86400}d"
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    if seconds >= 60 and seconds % 60 == 0:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
+
+
+# ##################################################################
+# needs periodic restart
+# checks if a running process is due for a scheduled periodic restart
+def needs_periodic_restart(name: str) -> bool:
+    state = load_state()
+    process_state = state.get(name)
+    if not isinstance(process_state, dict):
+        return False
+    interval = process_state.get("restart_interval_seconds")
+    if not interval:
+        return False
+    pid = process_state.get("pid")
+    if pid is None:
+        return False
+    last_periodic = process_state.get("last_periodic_restart")
+    if last_periodic is None:
+        # use start_time as baseline - parse it to unix timestamp
+        start_time_str = process_state.get("start_time")
+        if start_time_str:
+            dt = _parse_lstart_time(start_time_str)
+            if dt:
+                last_periodic = dt.timestamp()
+    if last_periodic is None:
+        return False
+    return (time.time() - last_periodic) >= interval
+
+
+# ##################################################################
+# perform periodic restart
+# stops and restarts a process for scheduled maintenance, updating the periodic restart timestamp
+def perform_periodic_restart(name: str) -> Optional[int]:
+    config = load_config()
+    if name not in config:
+        return None
+    port = config[name].get("port")
+
+    pid = get_process_status(name)
+    if pid is not None:
+        stop_process(name, mark_explicit=False)
+        wait_for_process_death(pid, timeout_seconds=10)
+
+    if port is not None and not is_port_free(port):
+        force_free_port(port)
+
+    new_pid = start_process(name)
+
+    # update periodic restart timestamp
+    state = load_state()
+    if isinstance(state.get(name), dict):
+        state[name]["last_periodic_restart"] = time.time()
+        save_state(state)
+
+    return new_pid
+
+
+# ##################################################################
+# set restart interval
+# configures a periodic restart interval for a process (or clears it with None)
+def set_restart_interval(name: str, interval_seconds: Optional[int]) -> None:
+    state_data = _load_state_file()
+    processes = state_data.get("processes", {})
+    if name not in processes:
+        raise ValueError(f"Process {name} not found")
+    if not isinstance(processes[name], dict):
+        processes[name] = {"pid": processes[name]}
+    if interval_seconds is not None:
+        processes[name]["restart_interval_seconds"] = interval_seconds
+        # set initial baseline if not already set
+        if "last_periodic_restart" not in processes[name]:
+            processes[name]["last_periodic_restart"] = time.time()
+    else:
+        processes[name].pop("restart_interval_seconds", None)
+        processes[name].pop("last_periodic_restart", None)
+    _save_state_file(state_data)
+
+
+# ##################################################################
+# get restart interval
+# returns the periodic restart interval in seconds for a process, or None if not set
+def get_restart_interval(name: str) -> Optional[int]:
+    state = load_state()
+    process_state = state.get(name)
+    if not isinstance(process_state, dict):
+        return None
+    return process_state.get("restart_interval_seconds")
+
+
+# ##################################################################
 # should restart process
 # determines if a process should be restarted based on its state and backoff
 def should_restart_process(name: str) -> bool:
@@ -861,6 +1040,14 @@ def watch_and_restart_processes() -> None:
         if pid is not None:
             # process is running - check if we should reset backoff
             check_and_reset_backoff(name)
+            # check if periodic restart is due
+            if needs_periodic_restart(name):
+                try:
+                    interval = get_restart_interval(name) or 0
+                    new_pid = perform_periodic_restart(name)
+                    print(f"Periodic restart of {name} (every {format_interval(interval)}) with pid {new_pid}")
+                except Exception as err:
+                    print(f"Failed periodic restart of {name}: {err}")
             continue
         if not should_restart_process(name):
             continue
