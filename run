@@ -138,7 +138,7 @@ def command_restart(args: argparse.Namespace) -> int:
         # force-free port if configured - kill anything still holding it
         if port is not None and not dm.is_port_free(port):
             print(f"Force-freeing port {port}...")
-            if not dm.force_free_port(port, timeout_seconds=10):
+            if not dm.force_free_port(port):
                 print(f"Error: Port {port} is still in use after killing all holders")
                 print(f"Check what's using it: lsof -i :{port}")
                 return 1
