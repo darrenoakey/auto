@@ -118,34 +118,8 @@ def command_stop(args: argparse.Namespace) -> int:
 def command_restart(args: argparse.Namespace) -> int:
     name = args.name
     try:
-        # get process config for port info
-        config = dm.load_config()
-        if name not in config:
-            print(f"Error: Process {name} not found in config")
-            return 1
-        port = config[name].get("port")
-
-        # stop if running and wait for it to die
-        pid = dm.get_process_status(name)
-        if pid is not None:
-            dm.stop_process(name)
-            print(f"Stopping {name}...")
-            if not dm.wait_for_process_death(pid, timeout_seconds=10):
-                print(f"Error: Process {name} did not die within timeout")
-                return 1
-            print(f"Stopped {name}")
-
-        # force-free port if configured - kill anything still holding it
-        if port is not None and not dm.is_port_free(port):
-            print(f"Force-freeing port {port}...")
-            if not dm.force_free_port(port):
-                print(f"Error: Port {port} is still in use after killing all holders")
-                print(f"Check what's using it: lsof -i :{port}")
-                return 1
-
-        # start
-        pid = dm.start_process(name)
-        print(f"Started {name} with pid {pid}")
+        pid = dm.restart_process(name)
+        print(f"Restarted {name} with pid {pid}")
         return 0
     except Exception as err:
         print(f"Error: {err}")

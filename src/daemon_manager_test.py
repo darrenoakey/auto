@@ -732,6 +732,110 @@ def test_restart_dead_processes(temp_dir):
 
 
 # ##################################################################
+# test restart process stops and starts with new pid
+# ensures restart_process kills the old process and starts a new one
+def test_restart_process(temp_dir):
+    dm.add_process("sleeper", "sleep 100")
+    old_pid = dm.start_process("sleeper")
+    assert dm.is_process_alive(old_pid)
+
+    new_pid = dm.restart_process("sleeper")
+    assert new_pid != old_pid
+    assert dm.is_process_alive(new_pid)
+    assert not dm.is_process_alive(old_pid)
+    # should not be marked explicitly stopped
+    assert not dm.is_explicitly_stopped("sleeper")
+    os.kill(new_pid, signal.SIGKILL)
+
+
+# ##################################################################
+# test restart process when not running just starts
+# ensures restart_process works even if the process isn't currently running
+def test_restart_process_when_not_running(temp_dir):
+    dm.add_process("sleeper", "sleep 100")
+    pid = dm.restart_process("sleeper")
+    assert pid is not None
+    assert dm.is_process_alive(pid)
+    assert not dm.is_explicitly_stopped("sleeper")
+    os.kill(pid, signal.SIGKILL)
+
+
+# ##################################################################
+# test restart process clears explicit stop on failure
+# ensures watch daemon can recover if restart fails to start the new process
+def test_restart_process_clears_explicit_stop_on_start_failure(temp_dir, monkeypatch):
+    dm.add_process("bad", "sleep 100")
+    pid = dm.start_process("bad")
+    assert dm.is_process_alive(pid)
+
+    # make start_process raise after stop has already happened
+    original_start = dm.start_process
+
+    def failing_start(name):
+        raise RuntimeError("simulated start failure")
+
+    monkeypatch.setattr(dm, "start_process", failing_start)
+
+    with pytest.raises(RuntimeError, match="simulated start failure"):
+        dm.restart_process("bad")
+
+    # old process should be dead
+    assert not dm.is_process_alive(pid)
+    # must NOT be marked explicitly stopped — watch daemon should be able to retry
+    assert not dm.is_explicitly_stopped("bad")
+
+
+# ##################################################################
+# test restart process frees port
+# ensures restart_process frees the port even if orphaned children hold it
+def test_restart_process_frees_port(temp_dir):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    # spawn a port holder in its own session
+    holder = subprocess.Popen(
+        ["python3", "-c",
+         f"import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',{port})); s.listen(1); time.sleep(300)"],
+        start_new_session=True
+    )
+    time.sleep(0.5)
+    assert not dm.is_port_free(port)
+
+    dm.add_process("test", "sleep 100", port=port)
+    pid = dm.restart_process("test")
+    assert pid is not None
+    assert dm.is_process_alive(pid)
+
+    dm.stop_process("test")
+    try:
+        holder.kill()
+        holder.wait(timeout=2)
+    except Exception:
+        pass
+
+
+# ##################################################################
+# test restart process kills stubborn process
+# ensures restart_process escalates to SIGKILL for processes that trap SIGTERM
+def test_restart_process_kills_stubborn(temp_dir):
+    script_path = temp_dir / "trap_sigterm.sh"
+    script_path.write_text("#!/bin/bash\ntrap '' TERM\nsleep 999\n")
+    script_path.chmod(0o755)
+
+    dm.add_process("stubborn", str(script_path))
+    old_pid = dm.start_process("stubborn")
+    time.sleep(0.2)
+    assert dm.is_process_alive(old_pid)
+
+    new_pid = dm.restart_process("stubborn")
+    assert not dm.is_process_alive(old_pid)
+    assert dm.is_process_alive(new_pid)
+    os.kill(new_pid, signal.SIGKILL)
+
+
+# ##################################################################
 # test parse interval
 # ensures various human-readable interval strings are parsed correctly
 def test_parse_interval():
@@ -896,3 +1000,31 @@ def test_save_state_file_creates_backup(temp_dir):
     import json
     backup_data = json.loads(backup_path.read_text())
     assert "myservice" in backup_data.get("processes", {})
+
+
+# ##################################################################
+# test concurrent state saves do not race on the temp file
+# a FIXED temp name made concurrent _save_state_file calls fail with ENOENT
+# (one process's rename consumed the temp the other wrote); per-write unique
+# temps + os.replace must make concurrent saves safe
+def test_save_state_file_concurrent(temp_dir):
+    import threading
+    import json
+    errors = []
+
+    def worker(n):
+        try:
+            for _ in range(20):
+                dm._save_state_file({"processes": {f"svc{n}": {"command": "sleep 1"}}})
+        except BaseException as e:  # noqa: BLE001
+            errors.append(repr(e))
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"concurrent saves raised: {errors}"
+    data = json.loads(dm.get_state_path().read_text())
+    assert isinstance(data.get("processes"), dict)

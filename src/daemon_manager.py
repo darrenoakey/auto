@@ -5,6 +5,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -190,13 +191,26 @@ def _load_state_file() -> dict:
 def _save_state_file(state_data: dict) -> None:
     state_path = get_state_path()
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    # atomic write: write to temp file then rename
-    tmp_path = state_path.with_suffix(".json.tmp")
-    tmp_path.write_text(json.dumps(state_data, indent=2))
-    tmp_path.rename(state_path)
+    payload = json.dumps(state_data, indent=2)
+    # atomic write with a PER-WRITE UNIQUE temp file. A fixed temp name
+    # (state.json.tmp) races across concurrent `auto` invocations: one process's
+    # rename consumes the temp the other just wrote, so the second rename raises
+    # ENOENT ("No such file or directory: state.json.tmp -> state.json"). mkstemp
+    # gives each writer its own temp path; os.replace is atomic on POSIX.
+    fd, tmp_name = tempfile.mkstemp(dir=str(state_path.parent), prefix=".state-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(payload)
+        os.replace(tmp_name, state_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
     # keep a backup for recovery from corruption
     backup_path = state_path.with_suffix(".json.bak")
-    backup_path.write_text(json.dumps(state_data, indent=2))
+    backup_path.write_text(payload)
 
 
 # ##################################################################
@@ -873,6 +887,93 @@ def reset_restart_attempt(name: str) -> None:
 
 
 # ##################################################################
+# clear explicit stop
+# clears the explicitly_stopped flag so the watch daemon can manage the process
+def _clear_explicit_stop(name: str) -> None:
+    state = load_state()
+    if name in state and isinstance(state[name], dict):
+        state[name]["explicitly_stopped"] = False
+        save_state(state)
+
+
+# ##################################################################
+# obliterate process
+# kills a process with extreme prejudice: SIGTERM→SIGKILL→nuclear SIGKILL
+# returns True if the process is confirmed dead, raises RuntimeError if unkillable
+def _obliterate_process(name: str, pid: int, mark_explicit: bool = True) -> None:
+    # stop_process does SIGTERM→SIGKILL with timeouts + port cleanup
+    stop_process(name, mark_explicit=mark_explicit)
+
+    # verify the process is actually dead after stop_process claims success
+    if not is_process_alive(pid):
+        return
+
+    # nuclear fallback: direct SIGKILL to process group and process
+    try:
+        pgid = os.getpgid(pid)
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+    if not wait_for_process_death(pid, timeout_seconds=SIGKILL_TIMEOUT):
+        raise RuntimeError(f"Process {name} (pid {pid}) cannot be killed")
+
+
+# ##################################################################
+# ensure port free
+# verifies a port is free, force-kills anything holding it
+# raises RuntimeError if the port cannot be freed
+def _ensure_port_free(port: int, name: str) -> None:
+    if port is None or is_port_free(port):
+        return
+    if not force_free_port(port):
+        raise RuntimeError(
+            f"Cannot start {name}: port {port} still in use after "
+            f"killing all holders. Check: lsof -i :{port}"
+        )
+
+
+# ##################################################################
+# restart process
+# bulletproof restart: stop, obliterate, verify dead, free port, start
+# marks explicitly_stopped during operation to prevent watch daemon race
+# clears the flag if start fails so watch daemon can recover
+def restart_process(name: str) -> int:
+    config = load_config()
+    if name not in config:
+        raise ValueError(f"Process {name} not found in config")
+    port = config[name].get("port")
+
+    # phase 1: kill the process if running
+    pid = get_process_status(name)
+    if pid is not None:
+        # mark_explicit=True prevents watch daemon from racing us
+        _obliterate_process(name, pid, mark_explicit=True)
+
+    # phase 2: ensure port is free
+    try:
+        _ensure_port_free(port, name)
+    except Exception:
+        _clear_explicit_stop(name)
+        raise
+
+    # phase 3: start the new process
+    # start_process() sets explicitly_stopped=False internally
+    try:
+        new_pid = start_process(name)
+        reset_restart_attempt(name)
+        return new_pid
+    except Exception:
+        # start failed — clear explicit stop so watch daemon can recover
+        _clear_explicit_stop(name)
+        raise
+
+
+# ##################################################################
 # parse interval
 # converts a human-readable interval string like "24h", "30m", "7d" to seconds
 def parse_interval(interval_str: str) -> int:
@@ -936,6 +1037,7 @@ def needs_periodic_restart(name: str) -> bool:
 # ##################################################################
 # perform periodic restart
 # stops and restarts a process for scheduled maintenance, updating the periodic restart timestamp
+# uses mark_explicit=False since this is called from the watch loop (no race possible)
 def perform_periodic_restart(name: str) -> Optional[int]:
     config = load_config()
     if name not in config:
@@ -944,11 +1046,9 @@ def perform_periodic_restart(name: str) -> Optional[int]:
 
     pid = get_process_status(name)
     if pid is not None:
-        stop_process(name, mark_explicit=False)
-        wait_for_process_death(pid, timeout_seconds=10)
+        _obliterate_process(name, pid, mark_explicit=False)
 
-    if port is not None and not is_port_free(port):
-        force_free_port(port)
+    _ensure_port_free(port, name)
 
     new_pid = start_process(name)
 
