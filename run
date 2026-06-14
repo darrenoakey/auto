@@ -265,7 +265,16 @@ def command_watch(args: argparse.Namespace) -> int:
     print("Watching processes for automatic restart...")
     try:
         while True:
-            dm.watch_and_restart_processes()
+            # A single bad tick must never kill the supervisor: if it dies,
+            # launchd may throttle-unload the agent and then NOTHING is being
+            # supervised (every managed service drifts to dead). Swallow and log
+            # unexpected per-tick errors; only shutdown/interrupt break the loop.
+            try:
+                dm.watch_and_restart_processes()
+            except ShutdownRequested:
+                raise
+            except Exception as tick_error:
+                print(f"Watch tick error (continuing): {tick_error}", flush=True)
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nStopped watching")

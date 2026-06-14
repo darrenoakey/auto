@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import errno
+import hashlib
 import json
 import os
 import re
@@ -18,6 +20,36 @@ from typing import Optional
 SIGTERM_TIMEOUT = 5.0  # seconds to wait before escalating to SIGKILL
 SIGKILL_TIMEOUT = 5.0  # seconds to wait after SIGKILL before giving up
 SUCCESSFUL_START_THRESHOLD = 60  # seconds of uptime to reset backoff
+
+# restart backoff cap. macOS posix_spawn/fork can return EDEADLK ("Resource
+# deadlock avoided") when the host is briefly unable to spawn — e.g. under a
+# post-reboot I/O storm (Spotlight reindex + Time Machine) that drives load into
+# the hundreds. A transient like that should not become a multi-hour outage for
+# an otherwise-healthy service, so the cap is minutes, not the old 2h.
+MAX_RESTART_BACKOFF_SECONDS = 300  # 5 minutes
+
+# Per-service deterministic jitter (seconds) added to restart eligibility. When
+# several services' backoffs elapse at the same instant they would otherwise be
+# re-spawned in one synchronized burst, which under load can itself trigger the
+# spawn failure above and re-synchronize them in lockstep forever. Staggering by
+# a stable per-name offset breaks that loop.
+RESTART_JITTER_WINDOW = 30
+
+# A small stagger between spawns in start-all so the boot-time mass start does
+# not fire dozens of spawns in a single instant against a still-warming host.
+START_ALL_SPAWN_STAGGER = 0.2  # seconds between successive starts
+
+# Maximum fresh starts the watch loop performs in a single tick. The loop runs
+# once per second, so this spreads a post-reboot mass start across a few seconds
+# rather than firing every dead service's spawn in one instant.
+MAX_RESTARTS_PER_WATCH_TICK = 5
+
+# Transient spawn errors worth retrying: the host momentarily cannot fork/exec
+# (EDEADLK under load, EAGAIN at the process limit, ENOMEM). Not the service's
+# fault, so retry briefly instead of counting it against the backoff.
+TRANSIENT_SPAWN_ERRNOS = frozenset({errno.EDEADLK, errno.EAGAIN, errno.ENOMEM})
+SPAWN_RETRY_ATTEMPTS = 5
+SPAWN_RETRY_BASE_DELAY = 0.5  # seconds, multiplied by the attempt number
 
 # human-readable interval suffixes for restart_every parsing
 INTERVAL_SUFFIXES = {"s": 1, "m": 60, "h": 3600, "d": 86400}
@@ -507,6 +539,36 @@ def get_process_status(name: str) -> Optional[int]:
 
 
 # ##################################################################
+# spawn with retry
+# launches the command, retrying briefly on transient host spawn failures
+# (EDEADLK/EAGAIN/ENOMEM) so a momentary inability to fork does not look like a
+# crashed service. the retry sleep is jittered per-name so concurrent spawns do
+# not retry in lockstep. non-transient errors propagate immediately.
+def _spawn_with_retry(name, wrapped_command, log_file, workdir):
+    last_error = None
+    for attempt in range(SPAWN_RETRY_ATTEMPTS):
+        try:
+            return subprocess.Popen(
+                wrapped_command,
+                shell=True,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                cwd=workdir or None
+            )
+        except OSError as error:
+            if error.errno not in TRANSIENT_SPAWN_ERRNOS:
+                raise
+            last_error = error
+            if attempt < SPAWN_RETRY_ATTEMPTS - 1:
+                delay = SPAWN_RETRY_BASE_DELAY * (attempt + 1) + get_restart_jitter(name) / 100.0
+                time.sleep(delay)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Cannot start {name}: no spawn attempts were made")
+
+
+# ##################################################################
 # start process
 # launches a process with the given name and redirects output to log files
 def start_process(name: str) -> int:
@@ -539,15 +601,10 @@ def start_process(name: str) -> int:
 
     # start process with exec to replace shell with actual command
     wrapped_command = f"exec {command}"
-    process = subprocess.Popen(
-        wrapped_command,
-        shell=True,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-        cwd=workdir or None
-    )
-    log_file.close()
+    try:
+        process = _spawn_with_retry(name, wrapped_command, log_file, workdir)
+    finally:
+        log_file.close()
 
     # get the start time of the new process for identity verification
     start_time = get_process_start_time(process.pid)
@@ -840,9 +897,20 @@ def get_restart_backoff_seconds(name: str) -> int:
     if process_state is None or isinstance(process_state, int):
         return 1
     attempt = process_state.get("restart_attempt", 0)
-    max_backoff = 2 * 60 * 60
-    backoff = min(2 ** attempt, max_backoff)
+    backoff = min(2 ** attempt, MAX_RESTART_BACKOFF_SECONDS)
     return backoff
+
+
+# ##################################################################
+# get restart jitter
+# deterministic per-service offset (0..RESTART_JITTER_WINDOW-1 seconds) so that
+# services whose backoff elapses together do not restart in a synchronized burst.
+# stable across processes (uses a content hash, not the salted builtin hash()).
+def get_restart_jitter(name: str) -> int:
+    if RESTART_JITTER_WINDOW <= 0:
+        return 0
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()
+    return int(digest, 16) % RESTART_JITTER_WINDOW
 
 
 # ##################################################################
@@ -1105,7 +1173,7 @@ def should_restart_process(name: str) -> bool:
     last_restart = get_last_restart_time(name)
     if last_restart is None:
         return True
-    backoff = get_restart_backoff_seconds(name)
+    backoff = get_restart_backoff_seconds(name) + get_restart_jitter(name)
     elapsed = time.time() - last_restart
     return elapsed >= backoff
 
@@ -1135,6 +1203,11 @@ def check_and_reset_backoff(name: str) -> None:
 # monitors all configured processes and restarts those that have died unexpectedly
 def watch_and_restart_processes() -> None:
     config = load_config()
+    # Rate-limit fresh starts per tick. After a reboot every service is dead at
+    # once; starting them all in a single tick is the spawn burst that can trigger
+    # host-wide EDEADLK. The watch loop runs each second, so a small per-tick cap
+    # spreads the mass start over a handful of seconds with no blocking sleeps.
+    restarts_this_tick = 0
     for name in config:
         pid = get_process_status(name)
         if pid is not None:
@@ -1149,11 +1222,14 @@ def watch_and_restart_processes() -> None:
                 except Exception as err:
                     print(f"Failed periodic restart of {name}: {err}")
             continue
+        if restarts_this_tick >= MAX_RESTARTS_PER_WATCH_TICK:
+            continue
         if not should_restart_process(name):
             continue
         try:
             increment_restart_attempt(name)
             pid = start_process(name)
+            restarts_this_tick += 1
             backoff = get_restart_backoff_seconds(name)
             print(f"Restarted {name} with pid {pid} after {backoff}s backoff")
         except Exception as err:
@@ -1165,9 +1241,15 @@ def watch_and_restart_processes() -> None:
 # starts all configured processes that are not currently running
 def start_all_processes() -> None:
     config = load_config()
+    started_any = False
     for name in config:
         pid = get_process_status(name)
         if pid is None:
+            # stagger successive spawns so the boot-time mass start does not fire
+            # dozens of forks in a single instant against a still-warming host
+            if started_any and START_ALL_SPAWN_STAGGER > 0:
+                time.sleep(START_ALL_SPAWN_STAGGER)
+            started_any = True
             try:
                 start_process(name)
             except Exception as err:

@@ -5,7 +5,6 @@ import socket
 import subprocess
 import time
 from datetime import datetime
-from pathlib import Path
 
 import pytest
 
@@ -126,14 +125,16 @@ def test_exponential_backoff_increases(temp_dir):
 
 # ##################################################################
 # test backoff caps at max
-# ensures backoff never exceeds two hours
+# ensures backoff never exceeds the configured maximum (minutes, not hours) so a
+# transient host-wide spawn failure cannot become a multi-hour outage
 def test_backoff_caps_at_max(temp_dir):
     dm.add_process("test", "sleep 100")
     state = dm.load_state()
     state["test"] = {"pid": None, "explicitly_stopped": False, "restart_attempt": 100, "last_restart_time": None}
     dm.save_state(state)
     backoff = dm.get_restart_backoff_seconds("test")
-    assert backoff == 2 * 60 * 60
+    assert backoff == dm.MAX_RESTART_BACKOFF_SECONDS
+    assert dm.MAX_RESTART_BACKOFF_SECONDS <= 600  # minutes, not the old 2h
 
 
 # ##################################################################
@@ -152,11 +153,125 @@ def test_should_not_restart_before_backoff_elapsed(temp_dir):
 # ensures we restart once the backoff period has passed
 def test_should_restart_after_backoff_elapsed(temp_dir):
     dm.add_process("test", "sleep 100")
-    past_time = time.time() - 10
+    # well past backoff + the maximum possible jitter
+    past_time = time.time() - (dm.MAX_RESTART_BACKOFF_SECONDS + dm.RESTART_JITTER_WINDOW + 10)
     state = dm.load_state()
     state["test"] = {"pid": None, "explicitly_stopped": False, "restart_attempt": 2, "last_restart_time": past_time}
     dm.save_state(state)
     assert dm.should_restart_process("test")
+
+
+# ##################################################################
+# test restart jitter is deterministic and bounded
+# the same name always yields the same offset within the jitter window, so
+# scheduling is stable across checks and processes (no salted builtin hash)
+def test_restart_jitter_deterministic_and_bounded(temp_dir):
+    for name in ("sparkview", "book-search", "conductor", "pubsub"):
+        first = dm.get_restart_jitter(name)
+        second = dm.get_restart_jitter(name)
+        assert first == second
+        assert 0 <= first < dm.RESTART_JITTER_WINDOW
+
+
+# ##################################################################
+# test jitter desynchronizes simultaneously-backed-off services
+# the synchronized real-world failure was several services becoming eligible at
+# the exact same instant; their jitter offsets must spread them out
+def test_restart_jitter_desynchronizes_services(temp_dir):
+    names = ["book-search", "conductor", "pubsub", "gmail-archive", "sparkview", "auto-gui"]
+    offsets = {dm.get_restart_jitter(n) for n in names}
+    # not all collapsing onto the same second
+    assert len(offsets) > 1
+
+
+# ##################################################################
+# test eligibility waits out the jitter
+# a service that is past its raw backoff but still inside backoff+jitter must NOT
+# restart yet, so co-elapsing services do not fire in one synchronized burst
+def test_should_restart_accounts_for_jitter(temp_dir):
+    # pick a name with a non-zero jitter so the window is observable
+    name = next(n for n in ("conductor", "pubsub", "book-search", "sparkview", "auto-gui")
+               if dm.get_restart_jitter(n) > 0)
+    dm.add_process(name, "sleep 100")
+    backoff = 4  # restart_attempt 2 -> 2**2
+    # elapsed sits between raw backoff and backoff+jitter
+    elapsed = backoff + dm.get_restart_jitter(name) - 0.5
+    state = dm.load_state()
+    state[name] = {"pid": None, "explicitly_stopped": False, "restart_attempt": 2,
+                   "last_restart_time": time.time() - elapsed}
+    dm.save_state(state)
+    assert not dm.should_restart_process(name)
+
+
+# ##################################################################
+# test spawn retries transient failures then succeeds
+# macOS posix_spawn can return EDEADLK under load; a momentary failure must be
+# retried rather than counted as a crash
+def test_spawn_retries_transient_then_succeeds(temp_dir, monkeypatch):
+    import errno as _errno
+
+    class _FakeProc:
+        pid = 4242
+
+    calls = {"n": 0}
+
+    def fake_popen(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise OSError(_errno.EDEADLK, "Resource deadlock avoided")
+        return _FakeProc()
+
+    monkeypatch.setattr(dm.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(dm.time, "sleep", lambda *_: None)
+
+    with open(os.devnull, "w") as log_file:
+        proc = dm._spawn_with_retry("test", "exec sleep 100", log_file, None)
+
+    assert proc.pid == 4242
+    assert calls["n"] == 3
+
+
+# ##################################################################
+# test spawn does not retry non-transient failures
+# a genuinely bad command (ENOENT) must surface immediately, not after 5 retries
+def test_spawn_does_not_retry_nontransient(temp_dir, monkeypatch):
+    import errno as _errno
+
+    calls = {"n": 0}
+
+    def fake_popen(*args, **kwargs):
+        calls["n"] += 1
+        raise OSError(_errno.ENOENT, "No such file or directory")
+
+    monkeypatch.setattr(dm.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(dm.time, "sleep", lambda *_: None)
+
+    with open(os.devnull, "w") as log_file:
+        with pytest.raises(OSError) as exc:
+            dm._spawn_with_retry("test", "exec /nope", log_file, None)
+
+    assert exc.value.errno == _errno.ENOENT
+    assert calls["n"] == 1
+
+
+# ##################################################################
+# test watch caps fresh starts per tick
+# a post-reboot mass start must be spread across ticks, not fired in one instant
+def test_watch_caps_restarts_per_tick(temp_dir, monkeypatch):
+    total = dm.MAX_RESTARTS_PER_WATCH_TICK + 3
+    for i in range(total):
+        dm.add_process(f"svc{i}", "sleep 100")
+
+    started = []
+
+    def fake_start(name):
+        started.append(name)
+        return 100000 + len(started)
+
+    monkeypatch.setattr(dm, "start_process", fake_start)
+    dm.watch_and_restart_processes()
+
+    assert len(started) == dm.MAX_RESTARTS_PER_WATCH_TICK
 
 
 # ##################################################################
@@ -683,7 +798,7 @@ sleep 100
     script.chmod(0o755)
 
     dm.add_process("spawner", str(script), port=port)
-    pid = dm.start_process("spawner")
+    dm.start_process("spawner")
     # wait for the background child to actually bind the port (python startup is slow)
     deadline = time.time() + 3
     while dm.is_port_free(port) and time.time() < deadline:
@@ -704,7 +819,7 @@ def test_restart_dead_processes(temp_dir):
     # start all three
     pid_alive = dm.start_process("alive")
     pid_dead = dm.start_process("dead")
-    pid_stopped = dm.start_process("stopped")
+    dm.start_process("stopped")
 
     # kill "dead" without marking explicitly stopped
     os.kill(pid_dead, signal.SIGKILL)
@@ -769,8 +884,6 @@ def test_restart_process_clears_explicit_stop_on_start_failure(temp_dir, monkeyp
     assert dm.is_process_alive(pid)
 
     # make start_process raise after stop has already happened
-    original_start = dm.start_process
-
     def failing_start(name):
         raise RuntimeError("simulated start failure")
 
