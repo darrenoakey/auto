@@ -213,6 +213,9 @@ def test_spawn_retries_transient_then_succeeds(temp_dir, monkeypatch):
     class _FakeProc:
         pid = 4242
 
+        def poll(self):
+            return None  # alive after the verify grace period
+
     calls = {"n": 0}
 
     def fake_popen(*args, **kwargs):
@@ -224,8 +227,7 @@ def test_spawn_retries_transient_then_succeeds(temp_dir, monkeypatch):
     monkeypatch.setattr(dm.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(dm.time, "sleep", lambda *_: None)
 
-    with open(os.devnull, "w") as log_file:
-        proc = dm._spawn_with_retry("test", "exec sleep 100", log_file, None)
+    proc, log_path = dm._spawn_with_retry("test", "sleep 100", None)
 
     assert proc.pid == 4242
     assert calls["n"] == 3
@@ -246,11 +248,79 @@ def test_spawn_does_not_retry_nontransient(temp_dir, monkeypatch):
     monkeypatch.setattr(dm.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(dm.time, "sleep", lambda *_: None)
 
-    with open(os.devnull, "w") as log_file:
-        with pytest.raises(OSError) as exc:
-            dm._spawn_with_retry("test", "exec /nope", log_file, None)
+    with pytest.raises(OSError) as exc:
+        dm._spawn_with_retry("test", "/nope", None)
 
     assert exc.value.errno == _errno.ENOENT
+    assert calls["n"] == 1
+
+
+# ##################################################################
+# test spawn retries an ASYNC child-exec failure
+# the parent Popen succeeds (returns the shell's pid) but the shell's execve
+# fails under load and the shell dies writing a transient marker to the log.
+# this is the real-world failure that killed ~12 services at once; the spawner
+# must detect the dead child + transient marker and retry until one survives.
+def test_spawn_retries_async_exec_failure(temp_dir, monkeypatch):
+    class _DeadProc:
+        pid = 111
+
+        def poll(self):
+            return 1  # exited almost immediately (execve failed)
+
+        def wait(self, timeout=None):
+            return 1
+
+    class _LiveProc:
+        pid = 222
+
+        def poll(self):
+            return None  # survived
+
+    calls = {"n": 0}
+
+    def fake_popen(*args, **kwargs):
+        calls["n"] += 1
+        return _DeadProc() if calls["n"] < 3 else _LiveProc()
+
+    monkeypatch.setattr(dm.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(dm.time, "sleep", lambda *_: None)
+    # simulate the transient marker the dead shell wrote to its log
+    monkeypatch.setattr(dm, "_log_has_transient_exec_error", lambda _path: True)
+
+    proc, log_path = dm._spawn_with_retry("test", "sleep 100", None)
+
+    assert proc.pid == 222
+    assert calls["n"] == 3
+
+
+# ##################################################################
+# test spawn accepts a non-transient immediate exit without burning retries
+# if a process exits quickly but NOT due to a transient spawn error, the spawner
+# hands it back on the first attempt and lets normal restart logic handle it.
+def test_spawn_accepts_nontransient_quick_exit(temp_dir, monkeypatch):
+    class _DeadProc:
+        pid = 333
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    calls = {"n": 0}
+
+    def fake_popen(*args, **kwargs):
+        calls["n"] += 1
+        return _DeadProc()
+
+    monkeypatch.setattr(dm.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(dm.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(dm, "_log_has_transient_exec_error", lambda _path: False)
+
+    proc, log_path = dm._spawn_with_retry("test", "true", None)
+
+    assert proc.pid == 333
     assert calls["n"] == 1
 
 

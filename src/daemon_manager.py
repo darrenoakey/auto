@@ -51,6 +51,18 @@ TRANSIENT_SPAWN_ERRNOS = frozenset({errno.EDEADLK, errno.EAGAIN, errno.ENOMEM})
 SPAWN_RETRY_ATTEMPTS = 5
 SPAWN_RETRY_BASE_DELAY = 0.5  # seconds, multiplied by the attempt number
 
+# When the host is under heavy load the PARENT Popen succeeds (we get the shell's
+# pid) but the shell's own execve of the target fails ASYNCHRONOUSLY and the shell
+# dies within milliseconds, writing e.g. "Resource deadlock avoided" to the log.
+# Popen cannot report this, so we must verify the spawned process actually survived
+# its exec, and look for these transient markers to decide whether to retry.
+SPAWN_VERIFY_SECONDS = 0.4  # grace period to confirm the child survived its exec
+TRANSIENT_EXEC_MARKERS = (
+    "Resource deadlock avoided",       # EDEADLK in the child's execve
+    "Resource temporarily unavailable",  # EAGAIN
+    "Cannot allocate memory",          # ENOMEM
+)
+
 # human-readable interval suffixes for restart_every parsing
 INTERVAL_SUFFIXES = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
@@ -544,11 +556,44 @@ def get_process_status(name: str) -> Optional[int]:
 # (EDEADLK/EAGAIN/ENOMEM) so a momentary inability to fork does not look like a
 # crashed service. the retry sleep is jittered per-name so concurrent spawns do
 # not retry in lockstep. non-transient errors propagate immediately.
-def _spawn_with_retry(name, wrapped_command, log_file, workdir):
+def _sleep_spawn_backoff(name: str, attempt: int) -> None:
+    delay = SPAWN_RETRY_BASE_DELAY * (attempt + 1) + get_restart_jitter(name) / 100.0
+    time.sleep(delay)
+
+
+def _log_has_transient_exec_error(log_path) -> bool:
+    try:
+        text = Path(log_path).read_text(errors="replace")
+    except OSError:
+        return False
+    return any(marker in text for marker in TRANSIENT_EXEC_MARKERS)
+
+
+def _spawn_with_retry(name, command, workdir):
+    """Spawn `exec {command}` and return (process, log_path).
+
+    Retries on transient host spawn failures so a momentary inability to
+    fork/exec does not look like a crashed service. Handles BOTH failure shapes
+    seen under heavy host load:
+
+      1. Popen itself raising OSError (EDEADLK/EAGAIN/ENOMEM in the parent), and
+      2. the child shell's execve failing ASYNCHRONOUSLY — Popen returns the
+         shell's pid, then the shell dies within milliseconds writing a transient
+         marker (e.g. "Resource deadlock avoided") to the log. Popen cannot report
+         this, so we confirm the child survived its exec and, if it died with a
+         transient marker, retry.
+
+    The retry sleep is jittered per-name so concurrent spawns do not retry in
+    lockstep. A non-transient immediate exit is handed back as-is so the normal
+    restart/backoff machinery deals with it rather than burning retries here.
+    """
+    wrapped_command = f"exec {command}"
     last_error = None
     for attempt in range(SPAWN_RETRY_ATTEMPTS):
+        log_path = get_new_log_path(name)
+        log_file = open(log_path, "w")
         try:
-            return subprocess.Popen(
+            process = subprocess.Popen(
                 wrapped_command,
                 shell=True,
                 stdout=log_file,
@@ -557,12 +602,31 @@ def _spawn_with_retry(name, wrapped_command, log_file, workdir):
                 cwd=workdir or None
             )
         except OSError as error:
+            log_file.close()
             if error.errno not in TRANSIENT_SPAWN_ERRNOS:
                 raise
             last_error = error
             if attempt < SPAWN_RETRY_ATTEMPTS - 1:
-                delay = SPAWN_RETRY_BASE_DELAY * (attempt + 1) + get_restart_jitter(name) / 100.0
-                time.sleep(delay)
+                _sleep_spawn_backoff(name, attempt)
+            continue
+        log_file.close()
+
+        # Confirm the child actually survived its execve (failure shape 2).
+        time.sleep(SPAWN_VERIFY_SECONDS)
+        if process.poll() is None:
+            return process, log_path  # still alive after the grace period -> ok
+        if not _log_has_transient_exec_error(log_path):
+            # Exited quickly but not due to a transient spawn error: hand it back
+            # and let the normal restart logic handle it (don't burn retries).
+            return process, log_path
+        # Transient execve failure: reap the dead shell and retry.
+        last_error = OSError(errno.EDEADLK, f"{name}: shell execve failed transiently")
+        try:
+            process.wait(timeout=2)
+        except Exception:
+            pass
+        if attempt < SPAWN_RETRY_ATTEMPTS - 1:
+            _sleep_spawn_backoff(name, attempt)
     if last_error is not None:
         raise last_error
     raise RuntimeError(f"Cannot start {name}: no spawn attempts were made")
@@ -594,17 +658,10 @@ def start_process(name: str) -> int:
                 f"Check with: lsof -i :{port}"
             )
 
-    log_path = get_new_log_path(name)
-
-    # open log file
-    log_file = open(log_path, "w")
-
-    # start process with exec to replace shell with actual command
-    wrapped_command = f"exec {command}"
-    try:
-        process = _spawn_with_retry(name, wrapped_command, log_file, workdir)
-    finally:
-        log_file.close()
+    # Spawn the process (retrying transient host fork/exec failures) and verify
+    # it survived its exec. _spawn_with_retry owns the per-attempt log files and
+    # returns the one belonging to the surviving process.
+    process, log_path = _spawn_with_retry(name, command, workdir)
 
     # get the start time of the new process for identity verification
     start_time = get_process_start_time(process.pid)
