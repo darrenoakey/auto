@@ -3,6 +3,6 @@ local/
 __pycache__/
 *.pyc
 *.pyo
+*.test
+*.out
 .DS_Store
-state.json
-state.json

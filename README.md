@@ -8,6 +8,8 @@ A lightweight daemon process manager for macOS that keeps your services running 
 
 Auto manages background processes on your Mac. It starts services, keeps them running automatically, and restarts them if they crash. You register a process once, and auto ensures it stays alive—including after system restarts.
 
+Auto is written in Go and ships as a code-signed `Auto.app`. Because the watch daemon runs as its own stably-signed responsible process, every service it spawns inherits auto's code identity—so a single macOS **Local Network** grant (System Settings → Privacy & Security → Local Network) covers all managed services and persists across rebuilds.
+
 ## Installation
 
 ```bash
@@ -162,8 +164,11 @@ auto ps
 | `show <name>` | Display the command for a process |
 | `log <name> [--tail] [--file]` | View process logs |
 | `start-all` | Start all configured processes |
+| `stop-all` | Stop all running processes (watch daemon respawns them) |
+| `restart-all` | Restart all dead, non-stopped processes |
 | `watch` | Monitor and restart crashed processes |
-| `install` | Install the daemon and wrapper script |
+| `shutdown` | Stop everything and the daemon for a clean reboot |
+| `install` | Build, sign, and load the daemon and wrapper script |
 
 ## Uninstalling
 
@@ -172,7 +177,7 @@ auto ps
 for name in $(auto ps | tail -n +2 | awk '{print $1}'); do auto stop "$name"; done
 
 # Unload the LaunchAgent
-launchctl unload ~/Library/LaunchAgents/com.darrenoakey.auto.plist
+launchctl bootout gui/$(id -u)/com.darrenoakey.auto
 
 # Remove files
 rm ~/Library/LaunchAgents/com.darrenoakey.auto.plist

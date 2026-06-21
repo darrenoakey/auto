@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>Auto</string>
+	<key>CFBundleDisplayName</key>
+	<string>Auto</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.darrenoakey.auto</string>
+	<key>CFBundleExecutable</key>
+	<string>auto</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<!-- Headless daemon: no dock icon, runs in the background. -->
+	<key>LSUIElement</key>
+	<true/>
+	<key>LSBackgroundOnly</key>
+	<true/>
+	<!-- The whole point of the Go rewrite: auto is the stable, signed responsible
+	     process for every service it spawns, so this single Local Network grant
+	     (made once in System Settings) covers all managed processes. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Auto supervises background services that connect to devices and servers on your local network.</string>
+	<!-- Belt-and-suspenders App Nap opt-out at the bundle level (also done at runtime). -->
+	<key>LSAppNapIsDisabled</key>
+	<true/>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+</dict>
+</plist>

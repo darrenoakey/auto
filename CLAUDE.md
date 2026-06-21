@@ -1,129 +1,112 @@
 # Auto Project
 
-## Important: Keep Skill Definition in Sync
+`auto` is a macOS daemon process manager, written in **Go** and shipped as a
+**code-signed `Auto.app`** so it can hold a stable code identity. It keeps a set
+of long-running services alive (restart on crash, restart on login, periodic
+restarts) using a single `local/state.json` file for both definitions and runtime
+state.
 
-When making changes to this project (commands, features, usage, etc.), you MUST also update the corresponding skill definition at:
+## Build / Run
 
-`~/.claude/skills/auto`
+The `run` script (bash facade) is the only entry point for builds:
 
-This ensures Claude Code's skill system stays in sync with the actual implementation.
+- `./run build` — compile `cmd/*` and assemble + **code-sign** `output/Auto.app`.
+- `./run check` — full quality gate: `gofmt`, `go vet`, `golangci-lint`, all tests.
+- `./run install` (= `rebuild`) — build, sign, and (re)load the LaunchAgent.
+- `./run logs` — tail the live daemon log.
+- Any other verb is passed straight to the signed binary (`./run ps`, etc.).
 
-## Key Architecture
+Runtime commands (`ps start stop restart add update remove show status log
+start-all stop-all restart-all watch shutdown install`) are handled by the Go
+binary. `~/bin/auto` execs the signed app binary directly.
 
-### PID Identity Verification
+## Why signed (the whole point of the Go rewrite)
 
-Processes are tracked by both `pid` AND `start_time` in state.json. This handles PID reuse after reboot:
-- After reboot, old PIDs get reused by different system processes
-- `is_our_process(pid, start_time)` verifies both match before considering a process "alive"
-- If no `start_time` stored (old entries), treats as stale to force restart with proper tracking
+Services under the old Python `auto` did not get macOS **Local Network**
+authorization: a bash/python launcher became the TCC "responsible process", so the
+grant never stuck and the app never appeared in System Settings.
 
-### LaunchAgent Environment
+The fix is structural:
+- `Auto.app` is a real bundle with `CFBundleIdentifier` + `NSLocalNetworkUsage-
+  Description`, signed with a **stable** Apple Development identity (TCC keys on
+  Team ID + bundle id, constant across rebuilds — see `~/src/sparkview`).
+- launchd execs the signed binary **directly** (`ProgramArguments` =
+  `Auto.app/Contents/MacOS/auto watch`), so `auto` is its OWN responsible process.
+- Every service `auto` spawns inherits `auto` as the responsible process, so **one**
+  Local Network grant (made once in System Settings → Privacy & Security → Local
+  Network) covers all managed services, and it persists across rebuilds.
 
-The plist at `~/Library/LaunchAgents/com.darrenoakey.auto.plist` must include `LANG` in EnvironmentVariables:
-- Without LANG, `ps -o lstart=` returns US format: `Mon Jan 26`
-- With `en_AU` locale, same command returns: `Mon 26 Jan`
-- `_parse_lstart_time()` handles both formats, so mixed format entries in state.json work correctly
-- LANG should still be set consistently to avoid confusion when reading state.json manually
+A child must be spawned **by the launchd daemon** to inherit auto's identity.
+A service spawned by a terminal `auto start` is attributed to the terminal instead.
+To re-parent everything under the signed daemon, `auto stop-all` kills all managed
+processes (without marking them stopped) and the watch loop respawns them.
 
-### SIGTERM Graceful Shutdown
+Note: an app that needs its own dock presence / window (e.g. sparkview) runs as its
+OWN signed LaunchAgent, not under auto.
 
-The watch loop (`command_watch`) registers a SIGTERM handler that raises `ShutdownRequested`:
-- During macOS system shutdown, SIGTERM is sent to all user processes
-- Without the handler, watch would detect dying managed processes and restart them, fighting the shutdown
-- The handler interrupts both `time.sleep()` and `watch_and_restart_processes()` mid-execution
-- On SIGTERM: stops the loop, calls `shutdown_all_processes()` (which does NOT mark processes as `explicitly_stopped`), exits cleanly
-- After reboot, processes will be auto-restarted by the watch loop since they aren't marked as explicitly stopped
+## Architecture (src/)
 
-### Process Status Display
+- `cmd/auto` — CLI dispatch, watch loop (SIGTERM → clean teardown), banner, App Nap
+  opt-out (CGo, darwin), and the `bundle/Info.plist` for the app bundle.
+- `pkg/manager` — all supervision logic on a `Manager` rooted at the project tree.
+- `pkg/install` — writes `~/bin/auto`, generates + loads the LaunchAgent plist.
 
-`auto ps` shows three states for the PID column:
-- `<pid>` — process is running
-- `stopped` — user explicitly stopped it (`auto stop`), watch won't restart it
-- `dead` — process died unexpectedly, watch will restart it (with backoff)
+### State file (`local/state.json`)
+One JSON object `{"processes": {name: {...}}}`. Each entry carries both definition
+(`command`, `port`, `workdir`) and runtime (`pid`, `start_time`, `explicitly_stopped`,
+`restart_attempt`, `last_restart_time`, `log_path`, `restart_interval_seconds`,
+`last_periodic_restart`). Field names/nullability match the original Python file so
+old state loads unchanged. Entries **without a command** are runtime-only stubs and
+are ignored everywhere (`definedNames`), matching the old `load_config`.
+
+### State writes are LOCKED (critical)
+Every load-modify-save goes through `Manager.withState`, which holds an exclusive
+`flock` on `local/state.lock` for the whole transaction. This serializes the watch
+daemon and any concurrent CLI invocation. **Do not** add a state mutation that
+loads and saves without `withState` / `mutateProcess` — concurrent read-modify-write
+without the lock previously wiped the entire state file. `mutateProcess` also never
+creates an entry for an unknown name (no stub resurrection of removed services).
+`saveStateFile` writes atomically (unique temp + rename) and refreshes `.bak`.
+
+### PID identity
+A process is "ours" only if its pid is alive AND its `ps -o lstart=` start time
+matches the recorded one — defeats PID reuse after reboot. The lstart parser accepts
+both US (`Mon Jan 26 …`) and en_AU (`Mon 26 Jan …`) locale forms; the LaunchAgent
+sets `LANG=en_AU.UTF-8` for consistency.
+
+### Restart backoff
+Exponential (1s, 2s, 4s …) capped at `MaxRestartBackoff` (5 min), with a stable
+per-name jitter so simultaneous backoffs don't fire in lockstep. Reset after
+`SuccessfulStartThreshold` (60s) of stable uptime. The exponent is bounded
+(`maxBackoffExp`) so `1<<n * time.Second` can never overflow and defeat the cap.
+The watch loop caps fresh starts per tick (`MaxRestartsPerWatchTick`) so a
+post-reboot mass start doesn't fire every fork at once.
+
+### Spawning
+`/bin/sh -c "exec <command>"` with `Setsid` (new session/process group), cwd =
+workdir, stdout+stderr → a timestamped log under `output/logs/<name>/YYYY/MM/`.
+Transient host fork/exec failures (EDEADLK/EAGAIN/ENOMEM) and async execve deaths
+(transient markers in the log) are retried. Surviving children get a `Wait4` reaper
+goroutine so the long-lived daemon never accumulates zombies.
+
+### Shutdown vs reload
+- System shutdown sends SIGTERM → the watch loop tears down all managed processes
+  cleanly (NOT marked explicitly stopped → they restart next boot).
+- `launchctl bootout` also SIGTERMs the daemon → same clean teardown; install uses
+  bootout+bootstrap. (`kickstart -k` SIGKILLs the whole job tree, killing the
+  managed services anyway, so it offers nothing better.)
+- Either way the fresh daemon restarts everything; managed services briefly drop
+  during a daemon reinstall. This is inherent to the launchd-job model.
 
 ## Gotchas
 
-### "Process shows running but isn't responding"
+- **Commands are relative to `workdir`** — use `./run serve`, not `run serve`
+  (a bare `run` is not on PATH and fails with `exec: run: not found`).
+- `auto add <name> <cmd>` sets `workdir` to the **current directory**; cd into the
+  project first, or fix it later with `auto update <name> --workdir <dir>`.
+- Reading Time Machine backups needs Full Disk Access (TCC); `sudo tmutil`/`sudo
+  cat` are blocked without it. `sudo` CAN attach the sparsebundle and list
+  snapshots, but not read the backed-up files.
 
-1. Check if PID actually belongs to expected process: `ps -p <pid> -o comm,args`
-2. After reboot, PIDs get reused - state.json may have stale entries
-3. Use `lsof -i :<port>` to find what's actually listening
-
-### Banner Auto-Suppression
-
-The banner is automatically suppressed when AI agent env vars are detected (`CLAUDECODE`, `CODEX_SANDBOX`, `GEMINI_CLI`). Use `--banner` to force it on, `-q` to explicitly suppress.
-
-### Port conflicts during restart
-
-Largely resolved by aggressive port clearing — `start_process()`, `command_restart`, and watch loop all force-free ports before starting. If port is still occupied after two kill rounds, RuntimeError is raised with `lsof` hint.
-
-### `auto update --command`
-
-`auto update <name> --command "new cmd"` changes the command for an existing service. Also supports `--port` and `--workdir`. Does NOT automatically restart — use `auto restart <name>` after updating.
-
-## Process Management Patterns
-
-### Process Group Killing
-
-Processes are started with `start_new_session=True` which creates a new process group:
-- This is critical for services like uvicorn that spawn worker/reloader subprocesses
-- When stopping, MUST use `os.killpg(pgid, signal)` to kill the entire group
-- Using `os.kill(pid, signal)` only kills the parent, leaving orphaned children
-- Get pgid with `os.getpgid(pid)` before sending signals
-
-### SIGTERM→SIGKILL Escalation
-
-`stop_process()` uses a two-stage termination pattern:
-1. Send SIGTERM to process group, wait 5 seconds (`SIGTERM_TIMEOUT`)
-2. If still alive, send SIGKILL to process group, wait 5 seconds (`SIGKILL_TIMEOUT`)
-3. If still alive after SIGKILL, raise RuntimeError
-
-This handles stubborn processes that trap SIGTERM (e.g., shell scripts with `trap '' TERM`).
-
-### Aggressive Port Clearing
-
-`start_process()` calls `force_free_port()` BEFORE spawning subprocess:
-- `kill_port_holders()` finds PIDs via `lsof` and kills their **process groups** (`os.killpg`)
-- `force_free_port()` retries up to 5 times (kill → wait 2s → repeat)
-- `stop_process()` port cleanup is best-effort (no raise) — `start_process` is the final gate
-- All port freeing is centralized in `start_process` — watch loop and restart-all just call it
-
-### Reboot Shutdown (`auto shutdown`)
-
-`auto shutdown` is for cleanly stopping everything before a computer restart:
-1. **Kills the watch daemon FIRST** via `launchctl bootout` — prevents it from restarting processes during shutdown
-2. SIGTERMs all managed process groups **in parallel** (not sequentially) — fast teardown
-3. Any survivors after 5s get SIGKILLed in parallel
-4. Does NOT mark as `explicitly_stopped` — after reboot, watch daemon restarts them all
-
-Key difference from `auto stop <name>`: `stop` marks `explicitly_stopped=True` so watch won't restart.
-`shutdown` leaves `explicitly_stopped=False` so everything recovers after reboot.
-
-### Exponential Backoff with Stability Reset
-
-Restart backoff doubles with each failure (1s, 2s, 4s... up to 2 hours):
-- `restart_attempt` counter tracks consecutive failures
-- `last_restart_time` records when restart was attempted
-- `check_and_reset_backoff()` monitors process uptime
-- After 60 seconds of stable operation (`SUCCESSFUL_START_THRESHOLD`), backoff resets to 0
-- Prevents indefinite backoff accumulation for normally stable processes
-- Called every watch cycle for running processes
-
-### Periodic Restarts
-
-Processes can be configured for scheduled periodic restarts:
-- `auto update <name> --restart-every 24h` sets a daily restart schedule
-- `auto update <name> --restart-every off` disables periodic restart
-- Also available on `auto add --restart-every`
-- State fields: `restart_interval_seconds` (int) and `last_periodic_restart` (unix timestamp)
-- Watch loop checks running processes each cycle; when elapsed time >= interval, performs graceful restart
-- `perform_periodic_restart()` does stop (mark_explicit=False) → force-free port → start → update timestamp
-- `auto ps` shows the RESTART column with the interval (e.g. `1d`, `12h`, `30m`) or `-` if none
-- Interval format: `30m`, `12h`, `24h`, `7d`, `90s`, or raw seconds
-
-### Restarting Auto Itself
-
-The auto watch daemon runs as a LaunchAgent with `KeepAlive=true`. To restart it without affecting managed processes:
-- `launchctl kickstart -k "gui/$(id -u)/com.darrenoakey.auto"` — kills and restarts the watch loop
-- Or `./run install` — reinstalls the plist and reloads the LaunchAgent
-- Managed processes are untouched because only the watch loop is restarted
+## Keep the skill in sync
+When changing commands/behaviour, also update `~/.claude/skills/auto/SKILL.md`.

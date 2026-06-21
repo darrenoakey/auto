@@ -1,422 +1,165 @@
-#!/usr/bin/env python3
-import argparse
-import os
-import signal
-import subprocess
-import sys
-import time
-from pathlib import Path
+#!/bin/bash
+set -euo pipefail
 
-# add src to path so we can import our modules
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+# Auto — daemon process manager (Go). This facade builds and code-signs Auto.app,
+# runs the quality gate, and installs the watch daemon as its own LaunchAgent. The
+# signed bundle is what makes auto the stable "responsible process" for every
+# service it spawns, so a single macOS Local Network grant covers them all.
 
-import daemon_manager as dm
-import installer
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SRC_DIR="$SCRIPT_DIR/src"
+OUTPUT_DIR="$SCRIPT_DIR/output"
+BIN_DIR="$OUTPUT_DIR/bin"
+TEST_DIR="$OUTPUT_DIR/testing"
+APP_BUNDLE="$OUTPUT_DIR/Auto.app"
+APP_EXE="$APP_BUNDLE/Contents/MacOS/auto"
+BUNDLE_ID="com.darrenoakey.auto"
 
-class ShutdownRequested(Exception):
-    pass
+mkdir -p "$BIN_DIR" "$TEST_DIR"
 
+usage() {
+    echo "Usage: $0 <command> [args]"
+    echo ""
+    echo "Build/admin commands:"
+    echo "  build              Build binaries and the signed Auto.app bundle"
+    echo "  test [pkg] [args]  Run tests for a package"
+    echo "  lint               Run gofmt, go vet, and golangci-lint"
+    echo "  check              Full quality gate (lint + all tests)"
+    echo "  install            Build, sign, and (re)load the Auto LaunchAgent"
+    echo "  rebuild            Alias for install"
+    echo "  logs               Tail the live auto daemon log"
+    echo ""
+    echo "Anything else is passed straight to the signed binary, e.g.:"
+    echo "  ps  start <name>  stop <name>  restart <name>  add ...  stop-all  ..."
+    exit 1
+}
 
-# ANSI color codes for vibrant output
-class Color:
-    CYAN = '\033[96m'
-    MAGENTA = '\033[95m'
-    YELLOW = '\033[93m'
-    GREEN = '\033[92m'
-    BLUE = '\033[94m'
-    RED = '\033[91m'
-    RESET = '\033[0m'
-    BOLD = '\033[1m'
+# signing_identity finds a STABLE code-signing identity (Apple Development /
+# Developer ID for Darren Oakey). A stable identity is what makes the macOS Local
+# Network grant survive rebuilds: TCC keys on the Designated Requirement (Team ID
+# + bundle id), constant across builds and cert renewals. Falls back to ad-hoc
+# ("-") with a warning — ad-hoc changes identity every build so the grant would
+# NOT persist.
+signing_identity() {
+    local id
+    id="$( (security find-identity -v -p codesigning 2>/dev/null \
+            | grep -E "Apple Development: Darren Oakey|Developer ID Application: " \
+            | head -1 | awk '{print $2}') || true )"
+    if [ -n "$id" ]; then
+        echo "$id"
+    else
+        echo "-"
+    fi
+}
 
+cmd_build() {
+    echo "==> Building..."
+    cd "$SRC_DIR"
+    for dir in cmd/*/; do
+        name=$(basename "$dir")
+        go build -o "$BIN_DIR/$name" "./$dir"
+        echo "    Built $name -> output/bin/$name"
+    done
+    cmd_bundle
+    echo "==> Build complete."
+}
 
-# ##################################################################
-# show banner
-# displays a vibrant colorful banner for the auto daemon manager
-def show_banner() -> None:
-    banner = f"""
-{Color.CYAN}╔═══════════════════════════════════════════════════════════════╗
-{Color.CYAN}║  {Color.YELLOW}{Color.BOLD} ▄▄▄       █    ██ ▄▄▄█████▓ ▒█████  {Color.CYAN}                        ║
-{Color.CYAN}║  {Color.YELLOW}{Color.BOLD}▒████▄     ██  ▓██▒▓  ██▒ ▓▒▒██▒  ██▒{Color.CYAN}                        ║
-{Color.CYAN}║  {Color.GREEN}{Color.BOLD}▒██  ▀█▄  ▓██  ▒██░▒ ▓██░ ▒░▒██░  ██▒{Color.CYAN}                        ║
-{Color.CYAN}║  {Color.GREEN}{Color.BOLD}░██▄▄▄▄██ ▓▓█  ░██░░ ▓██▓ ░ ▒██   ██░{Color.CYAN}                        ║
-{Color.CYAN}║  {Color.MAGENTA}{Color.BOLD} ▓█   ▓██▒▒▒█████▓   ▒██▒ ░ ░ ████▓▒░{Color.CYAN}                        ║
-{Color.CYAN}║  {Color.MAGENTA}{Color.BOLD} ▒▒   ▓▒█░░▒▓▒ ▒ ▒   ▒ ░░   ░ ▒░▒░▒░ {Color.CYAN}                        ║
-{Color.CYAN}║  {Color.BLUE}{Color.BOLD}  ▒   ▒▒ ░░░▒░ ░ ░     ░      ░ ▒ ▒░ {Color.CYAN}                        ║
-{Color.CYAN}║  {Color.BLUE}{Color.BOLD}  ░   ▒    ░░░ ░ ░   ░      ░ ░ ░ ▒  {Color.CYAN}                        ║
-{Color.CYAN}║  {Color.RED}{Color.BOLD}      ░  ░   ░                  ░ ░  {Color.CYAN}                        ║
-{Color.CYAN}║                                                               ║
-{Color.CYAN}║      {Color.GREEN}Daemon Process Manager{Color.CYAN} - {Color.MAGENTA}Keep Your Services Running{Color.CYAN}      ║
-{Color.CYAN}╚═══════════════════════════════════════════════════════════════╝{Color.RESET}
-"""
-    print(banner)
+# cmd_bundle assembles output/Auto.app around the built binary and code-signs it
+# with a stable identity + fixed bundle id, so macOS attributes Local Network
+# access to the bundle (not a launcher) and the user's one-time grant persists.
+cmd_bundle() {
+    local id; id="$(signing_identity)"
+    echo "==> Bundling Auto.app (sign id: $id)"
+    rm -rf "$APP_BUNDLE"
+    mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
+    cp "$BIN_DIR/auto" "$APP_EXE"
+    cp "$SRC_DIR/cmd/auto/bundle/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
+    if [ "$id" = "-" ]; then
+        echo "    WARNING: no stable signing identity found; ad-hoc signing — the"
+        echo "             Local Network grant will NOT persist across rebuilds."
+    fi
+    codesign --force --options runtime --identifier "$BUNDLE_ID" \
+        --sign "$id" "$APP_BUNDLE" 2>&1 | sed 's/^/    /'
+    echo "    Bundled -> output/Auto.app"
+    codesign -dv "$APP_BUNDLE" 2>&1 \
+        | grep -E "Identifier|TeamIdentifier|Authority=Apple Development|Authority=Developer ID" \
+        | sed 's/^/    /' || true
+}
 
+cmd_test() {
+    local pkg="${1:-./...}"
+    shift 2>/dev/null || true
+    cd "$SRC_DIR"
+    echo "==> Testing $pkg"
+    go test "$pkg" -count=1 "$@" 2>&1 | tee "$TEST_DIR/test.log"
+}
 
-# ##################################################################
-# command ps
-# lists all configured processes with their current status
-def command_ps(args: argparse.Namespace) -> int:
-    processes = dm.list_processes()
-    if not processes:
-        print("No processes configured")
-        return 0
+cmd_lint() {
+    cd "$SRC_DIR"
+    local failed=0
+    echo "==> Checking formatting..."
+    if [ -n "$(gofmt -l .)" ]; then
+        echo "FAIL: gofmt found unformatted files:"; gofmt -l .; failed=1
+    else
+        echo "    gofmt: clean"
+    fi
+    echo "==> Running go vet..."
+    if ! go vet ./...; then failed=1; else echo "    go vet: clean"; fi
+    echo "==> Running golangci-lint..."
+    if command -v golangci-lint &>/dev/null; then
+        if ! golangci-lint run ./...; then failed=1; else echo "    golangci-lint: clean"; fi
+    else
+        echo "    golangci-lint: not installed, skipping"
+    fi
+    if [ "$failed" -ne 0 ]; then echo "==> Lint FAILED"; return 1; fi
+    echo "==> Lint passed."
+}
 
-    # calculate column widths
-    name_width = max(len(name) for name in processes.keys())
-    name_width = max(name_width, len("NAME"))
+cmd_check() {
+    echo "==> Running full quality gate..."
+    cmd_lint
+    echo ""
+    cd "$SRC_DIR"
+    echo "==> Running all tests..."
+    go test ./... -count=1 2>&1 | tee "$TEST_DIR/check.log"
+    echo "==> Quality gate PASSED. Safe to commit."
+}
 
-    # print header
-    print(f"{'NAME':<{name_width}}  {'PID':>6}  {'PORT':>5}  {'RESTART':>9}")
+cmd_install() {
+    cmd_build
+    echo "==> Installing signed daemon..."
+    "$APP_EXE" -q install
+}
 
-    # print each process
-    for name, info in sorted(processes.items()):
-        pid = info["pid"]
-        port = info.get("port")
-        if pid is not None:
-            pid_str = str(pid)
-        elif info.get("explicitly_stopped"):
-            pid_str = "stopped"
-        else:
-            pid_str = "dead"
-        port_str = str(port) if port is not None else "-"
-        interval = dm.get_restart_interval(name)
-        interval_str = dm.format_interval(interval) if interval else "-"
-        print(f"{name:<{name_width}}  {pid_str:>6}  {port_str:>5}  {interval_str:>9}")
-    return 0
+LA_LOG="$SCRIPT_DIR/output/logs/auto/auto.log"
 
+cmd_logs() {
+    if [ ! -f "$LA_LOG" ]; then
+        echo "No auto log yet at $LA_LOG" >&2; exit 1
+    fi
+    echo "==> Tailing $LA_LOG (Ctrl-C to stop)"
+    tail -n 50 -f "$LA_LOG"
+}
 
-# ##################################################################
-# command start
-# starts a configured process by name
-def command_start(args: argparse.Namespace) -> int:
-    name = args.name
-    try:
-        pid = dm.start_process(name)
-        print(f"Started {name} with pid {pid}")
-        return 0
-    except Exception as err:
-        print(f"Error: {err}")
-        return 1
+# run_binary passes runtime subcommands to the signed binary, building it first
+# if it is missing.
+run_binary() {
+    if [ ! -x "$APP_EXE" ]; then
+        echo "==> Auto.app not built yet; building..." >&2
+        cmd_build >&2
+    fi
+    exec "$APP_EXE" "$@"
+}
 
-
-# ##################################################################
-# command stop
-# stops a running process by name
-def command_stop(args: argparse.Namespace) -> int:
-    name = args.name
-    try:
-        dm.stop_process(name)
-        print(f"Stopped {name}")
-        return 0
-    except Exception as err:
-        print(f"Error: {err}")
-        return 1
-
-
-# ##################################################################
-# command restart
-# restarts a process by stopping and starting it
-def command_restart(args: argparse.Namespace) -> int:
-    name = args.name
-    try:
-        pid = dm.restart_process(name)
-        print(f"Restarted {name} with pid {pid}")
-        return 0
-    except Exception as err:
-        print(f"Error: {err}")
-        return 1
-
-
-# ##################################################################
-# command add
-# adds a new process to config and starts it immediately
-def command_add(args: argparse.Namespace) -> int:
-    name = args.name
-    command = " ".join(args.command)
-    port = args.port
-    try:
-        dm.add_process(name, command, port=port)
-        restart_every = getattr(args, "restart_every", None)
-        if restart_every:
-            interval = dm.parse_interval(restart_every)
-            dm.set_restart_interval(name, interval)
-        print(f"Added {name}")
-        pid = dm.start_process(name)
-        print(f"Started {name} with pid {pid}")
-        return 0
-    except Exception as err:
-        print(f"Error: {err}")
-        return 1
-
-
-# ##################################################################
-# command update
-# updates settings for an existing process
-def command_update(args: argparse.Namespace) -> int:
-    name = args.name
-    try:
-        dm.update_process(name, command=args.command, port=args.port, workdir=args.workdir)
-        restart_every = getattr(args, "restart_every", None)
-        if restart_every is not None:
-            if restart_every.lower() == "off":
-                dm.set_restart_interval(name, None)
-                print(f"Updated {name} (periodic restart disabled)")
-            else:
-                interval = dm.parse_interval(restart_every)
-                dm.set_restart_interval(name, interval)
-                print(f"Updated {name} (periodic restart every {dm.format_interval(interval)})")
-        else:
-            print(f"Updated {name}")
-        return 0
-    except Exception as err:
-        print(f"Error: {err}")
-        return 1
-
-
-# ##################################################################
-# command remove
-# removes a process from config and stops it if running
-def command_remove(args: argparse.Namespace) -> int:
-    name = args.name
-    try:
-        dm.remove_process(name)
-        print(f"Removed {name}")
-        return 0
-    except Exception as err:
-        print(f"Error: {err}")
-        return 1
-
-
-# ##################################################################
-# command show
-# displays the command line for a configured process
-def command_show(args: argparse.Namespace) -> int:
-    name = args.name
-    try:
-        command = dm.get_process_command(name)
-        print(f"{name}: {command}")
-        interval = dm.get_restart_interval(name)
-        if interval:
-            print(f"  restart every: {dm.format_interval(interval)}")
-        return 0
-    except Exception as err:
-        print(f"Error: {err}")
-        return 1
-
-
-# ##################################################################
-# command log
-# displays or tails the latest log file for a process
-def command_log(args: argparse.Namespace) -> int:
-    name = args.name
-    log_path = dm.get_latest_log_path(name)
-
-    if log_path is None:
-        print(f"No log file found for {name}")
-        return 1
-
-    if args.file:
-        print(log_path)
-        return 0
-
-    if args.tail:
-        subprocess.run(["tail", "-f", str(log_path)])
-        return 0
-
-    # default: cat the file
-    print(log_path.read_text(), end="")
-    return 0
-
-
-# ##################################################################
-# command start all
-# starts all configured processes that are not currently running
-def command_start_all(args: argparse.Namespace) -> int:
-    dm.start_all_processes()
-    print("Started all configured processes")
-    return 0
-
-
-# ##################################################################
-# command restart all
-# restarts all dead processes that are not explicitly stopped, force-freeing ports
-def command_restart_all(args: argparse.Namespace) -> int:
-    results = dm.restart_dead_processes()
-    if not results:
-        print("No dead processes to restart")
-        return 0
-    errors = False
-    for name, result in sorted(results.items()):
-        if isinstance(result, int):
-            print(f"Restarted {name} with pid {result}")
-        else:
-            print(f"Failed to restart {name}: {result}")
-            errors = True
-    return 1 if errors else 0
-
-
-# ##################################################################
-# command watch
-# continuously monitors and restarts dead processes with exponential backoff
-def command_watch(args: argparse.Namespace) -> int:
-    def handle_sigterm(signum, frame):
-        raise ShutdownRequested()
-
-    signal.signal(signal.SIGTERM, handle_sigterm)
-    print("Watching processes for automatic restart...")
-    try:
-        while True:
-            # A single bad tick must never kill the supervisor: if it dies,
-            # launchd may throttle-unload the agent and then NOTHING is being
-            # supervised (every managed service drifts to dead). Swallow and log
-            # unexpected per-tick errors; only shutdown/interrupt break the loop.
-            try:
-                dm.watch_and_restart_processes()
-            except ShutdownRequested:
-                raise
-            except Exception as tick_error:
-                print(f"Watch tick error (continuing): {tick_error}", flush=True)
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\nStopped watching")
-        return 0
-    except ShutdownRequested:
-        print("\nSIGTERM received, shutting down all processes...")
-        dm.shutdown_all_processes()
-        print("Shutdown complete")
-        return 0
-
-
-# ##################################################################
-# command shutdown
-# stops all managed processes and the auto daemon itself for computer reboot
-# does not mark processes as explicitly stopped so they restart automatically after reboot
-def command_shutdown(args: argparse.Namespace) -> int:
-    try:
-        config = dm.load_config()
-        running = sorted(name for name in config if dm.get_process_status(name) is not None)
-        if running:
-            print(f"Stopping {len(running)} managed process(es): {', '.join(running)}")
-        dm.shutdown_for_reboot()
-        print("Shutdown complete. Auto daemon stopped. Safe to reboot.")
-        return 0
-    except Exception as err:
-        print(f"Error: {err}")
-        return 1
-
-
-# ##################################################################
-# command install
-# installs auto daemon and creates wrapper script in ~/bin
-def command_install(args: argparse.Namespace) -> int:
-    try:
-        installer.install()
-        return 0
-    except Exception as err:
-        print(f"Error: {err}")
-        return 1
-
-
-# ##################################################################
-# main
-# parses arguments and dispatches to the appropriate command handler
-def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(
-        prog="auto",
-        description="Manage daemon processes"
-    )
-    parser.add_argument("-q", "--quiet", action="store_true",
-                       help="Suppress the banner output")
-    parser.add_argument("--banner", action="store_true",
-                       help="Force show the banner (overrides auto-suppression)")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    # ps command
-    ps_parser = subparsers.add_parser("ps", help="List all processes with status")
-    ps_parser.set_defaults(func=command_ps)
-
-    # start command
-    start_parser = subparsers.add_parser("start", help="Start a process")
-    start_parser.add_argument("name", help="Process name")
-    start_parser.set_defaults(func=command_start)
-
-    # stop command
-    stop_parser = subparsers.add_parser("stop", help="Stop a process")
-    stop_parser.add_argument("name", help="Process name")
-    stop_parser.set_defaults(func=command_stop)
-
-    # restart command
-    restart_parser = subparsers.add_parser("restart", help="Restart a process")
-    restart_parser.add_argument("name", help="Process name")
-    restart_parser.set_defaults(func=command_restart)
-
-    # add command
-    add_parser = subparsers.add_parser("add", help="Add a new process and start it")
-    add_parser.add_argument("name", help="Process name")
-    add_parser.add_argument("command", nargs="+", help="Command to run")
-    add_parser.add_argument("--port", type=int, help="Port the process listens on")
-    add_parser.add_argument("--restart-every", help="Periodic restart interval (e.g. 24h, 30m, 7d)")
-    add_parser.set_defaults(func=command_add)
-
-    # update command
-    update_parser = subparsers.add_parser("update", help="Update settings for an existing process")
-    update_parser.add_argument("name", help="Process name")
-    update_parser.add_argument("--command", help="New command to run")
-    update_parser.add_argument("--port", type=int, help="Port the process listens on")
-    update_parser.add_argument("--workdir", help="Working directory for the process")
-    update_parser.add_argument("--restart-every", help="Periodic restart interval (e.g. 24h, 30m, 7d) or 'off' to disable")
-    update_parser.set_defaults(func=command_update)
-
-    # remove command
-    remove_parser = subparsers.add_parser("remove", help="Remove a process")
-    remove_parser.add_argument("name", help="Process name")
-    remove_parser.set_defaults(func=command_remove)
-
-    # show command
-    show_parser = subparsers.add_parser("show", help="Show process command")
-    show_parser.add_argument("name", help="Process name")
-    show_parser.set_defaults(func=command_show)
-
-    # status command (alias for show)
-    status_parser = subparsers.add_parser("status", help="Show process status (alias for show)")
-    status_parser.add_argument("name", help="Process name")
-    status_parser.set_defaults(func=command_show)
-
-    # log command
-    log_parser = subparsers.add_parser("log", help="Show process log")
-    log_parser.add_argument("name", help="Process name")
-    log_parser.add_argument("--file", action="store_true", help="Print log file path only")
-    log_parser.add_argument("--tail", action="store_true", help="Tail the log file")
-    log_parser.set_defaults(func=command_log)
-
-    # start-all command (used by LaunchAgent)
-    start_all_parser = subparsers.add_parser("start-all", help="Start all configured processes")
-    start_all_parser.set_defaults(func=command_start_all)
-
-    # restart-all command
-    restart_all_parser = subparsers.add_parser("restart-all", help="Restart all dead processes (force-frees ports)")
-    restart_all_parser.set_defaults(func=command_restart_all)
-
-    # watch command
-    watch_parser = subparsers.add_parser("watch", help="Monitor and restart dead processes")
-    watch_parser.set_defaults(func=command_watch)
-
-    # shutdown command
-    shutdown_parser = subparsers.add_parser("shutdown", help="Stop all processes and auto daemon for reboot (restarts resume after next boot)")
-    shutdown_parser.set_defaults(func=command_shutdown)
-
-    # install command
-    install_parser = subparsers.add_parser("install", help="Install auto daemon and wrapper script")
-    install_parser.set_defaults(func=command_install)
-
-    args = parser.parse_args(argv)
-    # suppress banner when invoked by AI agents or with -q; show with --banner
-    ai_agent = any(os.environ.get(v) for v in ("CLAUDECODE", "CODEX_SANDBOX", "GEMINI_CLI"))
-    if args.banner or (not args.quiet and not ai_agent):
-        show_banner()
-    return args.func(args)
-
-
-# ##################################################################
-# standard python pattern for dispatching main
-if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+case "${1:-}" in
+    build)   shift; cmd_build "$@" ;;
+    bundle)  shift; cmd_bundle "$@" ;;
+    test)    shift; cmd_test "$@" ;;
+    lint)    shift; cmd_lint "$@" ;;
+    check)   shift; cmd_check "$@" ;;
+    install) shift; cmd_install "$@" ;;
+    rebuild) shift; cmd_install "$@" ;;
+    logs)    shift; cmd_logs "$@" ;;
+    "")      usage ;;
+    *)       run_binary "$@" ;;
+esac
