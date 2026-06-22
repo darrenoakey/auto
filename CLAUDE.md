@@ -27,9 +27,10 @@ authorization: a bash/python launcher became the TCC "responsible process", so t
 grant never stuck and the app never appeared in System Settings.
 
 The fix is structural:
-- `Auto.app` is a real bundle with `CFBundleIdentifier` + `NSLocalNetworkUsage-
-  Description`, signed with a **stable** Apple Development identity (TCC keys on
-  Team ID + bundle id, constant across rebuilds — see `~/src/sparkview`).
+- `Auto.app` is a real bundle with `CFBundleIdentifier`,
+  `NSLocalNetworkUsageDescription`, and `NSRemindersUsageDescription`, signed with
+  a **stable** Apple Development identity (TCC keys on Team ID + bundle id,
+  constant across rebuilds — see `~/src/sparkview`).
 - launchd execs the signed binary **directly** (`ProgramArguments` =
   `Auto.app/Contents/MacOS/auto watch`), so `auto` is its OWN responsible process.
 - Every service `auto` spawns inherits `auto` as the responsible process, so **one**

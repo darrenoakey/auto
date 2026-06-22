@@ -28,6 +28,8 @@
 	     (made once in System Settings) covers all managed processes. -->
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Auto supervises background services that connect to devices and servers on your local network.</string>
+	<key>NSRemindersUsageDescription</key>
+	<string>Auto supervises background services that read and update your reminders.</string>
 	<!-- Belt-and-suspenders App Nap opt-out at the bundle level (also done at runtime). -->
 	<key>LSAppNapIsDisabled</key>
 	<true/>
