@@ -19,30 +19,15 @@ func (m *Manager) ensureLogMigrated() {
 	_ = os.WriteFile(marker, nil, 0o644)
 }
 
-// newLogPath returns a unique log path for a process under
-// output/logs/<name>/<year>/<month>/<name>_<timestamp>.log.
-func (m *Manager) newLogPath(name string) string {
+// dailyLogPath returns the log path for a process on the current date under
+// output/logs/<name>/<year>/<month>/<name>_<YYYY-MM-DD>.log. Spawns within the
+// same day share one file (appended to); a new day starts a new file.
+func (m *Manager) dailyLogPath(name string) string {
 	m.ensureLogMigrated()
 	now := time.Now()
 	dir := filepath.Join(m.logDir(), name, now.Format("2006"), now.Format("01"))
 	_ = os.MkdirAll(dir, 0o755)
-	base := fmt.Sprintf("%s_%s.log", name, now.Format("060102_150405"))
-	return ensureUniquePath(filepath.Join(dir, base))
-}
-
-// ensureUniquePath appends _N before the extension until the path is free.
-func ensureUniquePath(path string) string {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return path
-	}
-	ext := filepath.Ext(path)
-	stem := path[:len(path)-len(ext)]
-	for counter := 1; ; counter++ {
-		candidate := fmt.Sprintf("%s_%d%s", stem, counter, ext)
-		if _, err := os.Stat(candidate); os.IsNotExist(err) {
-			return candidate
-		}
-	}
+	return filepath.Join(dir, fmt.Sprintf("%s_%s.log", name, now.Format("2006-01-02")))
 }
 
 // latestLogPath returns the most recent log file for a process, preferring the

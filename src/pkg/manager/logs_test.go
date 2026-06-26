@@ -5,42 +5,55 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
-func TestNewLogPathUnique(t *testing.T) {
+func TestDailyLogPathSameDay(t *testing.T) {
 	m := newTestManager(t)
-	first := m.newLogPath("svc")
+	first := m.dailyLogPath("svc")
 	if err := os.WriteFile(first, []byte("x"), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	second := m.newLogPath("svc")
-	if first == second {
-		t.Fatalf("expected unique paths, both = %s", first)
+	second := m.dailyLogPath("svc")
+	if first != second {
+		t.Fatalf("spawns within the same day must share one log path;\n first = %s\n second = %s", first, second)
 	}
 	if !strings.Contains(first, filepath.Join("logs", "svc")) {
 		t.Fatalf("log path %s not under logs/svc", first)
 	}
+	if !strings.HasSuffix(first, time.Now().Format("2006-01-02")+".log") {
+		t.Fatalf("daily log path %s should end with the current date", first)
+	}
 }
 
-func TestEnsureUniquePathAppendsSuffix(t *testing.T) {
-	dir := t.TempDir()
-	base := filepath.Join(dir, "a.log")
-	if got := ensureUniquePath(base); got != base {
-		t.Fatalf("non-existent path should be returned as-is, got %s", got)
-	}
-	if err := os.WriteFile(base, nil, 0o644); err != nil {
+func TestDailyLogPathAppends(t *testing.T) {
+	m := newTestManager(t)
+	path := m.dailyLogPath("svc")
+	if err := os.WriteFile(path, []byte("first\n"), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	got := ensureUniquePath(base)
-	if got != filepath.Join(dir, "a_1.log") {
-		t.Fatalf("ensureUniquePath = %s, want a_1.log", got)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := f.WriteString("second\n"); err != nil {
+		_ = f.Close()
+		t.Fatalf("write: %v", err)
+	}
+	_ = f.Close()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(got) != "first\nsecond\n" {
+		t.Fatalf("daily log should accumulate across spawns, got %q", got)
 	}
 }
 
 func TestLatestLogPathPrefersRecorded(t *testing.T) {
 	m := newTestManager(t)
 	mustAdd(t, m, "svc", "sleep 1", nil)
-	logPath := m.newLogPath("svc")
+	logPath := m.dailyLogPath("svc")
 	if err := os.WriteFile(logPath, []byte("hi"), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}

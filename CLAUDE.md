@@ -85,7 +85,7 @@ post-reboot mass start doesn't fire every fork at once.
 
 ### Spawning
 `/bin/sh -c "exec <command>"` with `Setsid` (new session/process group), cwd =
-workdir, stdout+stderr → a timestamped log under `output/logs/<name>/YYYY/MM/`.
+workdir, stdout+stderr → a daily log under `output/logs/<name>/YYYY/MM/<name>_YYYY-MM-DD.log`
 Transient host fork/exec failures (EDEADLK/EAGAIN/ENOMEM) and async execve deaths
 (transient markers in the log) are retried. Surviving children get a `Wait4` reaper
 goroutine so the long-lived daemon never accumulates zombies.
