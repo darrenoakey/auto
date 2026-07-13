@@ -46,6 +46,16 @@ var transientExecMarkers = []string{
 	"Cannot allocate memory",           // ENOMEM
 }
 
+// addressInUseMarkers are substrings written to a child's log when its own
+// bind() loses a TOCTOU race for its port: something else grabbed the port in
+// the gap between the pre-start free-port check and the child's actual bind
+// call. Matched case-insensitively against the log. Covers Go/BSD sockets,
+// Python's OSError, Node's listen EADDRINUSE, and Rust's "os error 48".
+var addressInUseMarkers = []string{
+	"address already in use",
+	"eaddrinuse",
+}
+
 // Manager owns a single auto project tree (state file + logs) rooted at root.
 // All operations are methods so tests can run against a temporary root.
 type Manager struct {

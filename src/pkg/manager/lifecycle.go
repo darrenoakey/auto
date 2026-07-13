@@ -6,8 +6,17 @@ import (
 	"time"
 )
 
+// afterPortCheckHook, when non-nil, runs after StartProcess confirms a
+// configured port is free and before it spawns the new process. It exists
+// only so tests can deterministically occupy the TOCTOU window between that
+// check and the child's own bind() call; production code never sets it.
+var afterPortCheckHook func(port int)
+
 // StartProcess launches a configured process, force-freeing its port first, and
-// records its pid and start time for identity verification.
+// records its pid and start time for identity verification. If the new
+// process still loses the race for its port (something re-grabs it between
+// this check and its own bind), spawnWithRetry forces the port free again and
+// retries within this same call so the caller sees a single converged start.
 func (m *Manager) StartProcess(name string) (int, error) {
 	def, ok := m.definition(name)
 	if !ok {
@@ -21,7 +30,10 @@ func (m *Manager) StartProcess(name string) (int, error) {
 			"cannot start %s: port %d still in use after killing all holders. Check with: lsof -i :%d",
 			name, *def.Port, *def.Port)
 	}
-	pid, logPath, err := m.spawnWithRetry(name, def.Command, def.Workdir)
+	if afterPortCheckHook != nil && def.Port != nil {
+		afterPortCheckHook(*def.Port)
+	}
+	pid, logPath, err := m.spawnWithRetry(name, def.Command, def.Workdir, def.Port)
 	if err != nil {
 		return 0, err
 	}
@@ -66,6 +78,12 @@ func waitForProcessDeath(pid int, timeout time.Duration) bool {
 
 // StopProcess terminates a running process group (SIGTERM then SIGKILL) and, by
 // default, marks it explicitly stopped so the watch loop will not restart it.
+// When markExplicit is set, the flag is written BEFORE the kill signal is even
+// sent, not after the process is confirmed dead: a concurrent WatchTick in the
+// daemon's watch loop reads state only through the lock, so once this write
+// lands it can never observe the process as "dead and not explicitly
+// stopped" and race a competing respawn into the gap while this call is still
+// tearing the old instance down.
 func (m *Manager) StopProcess(name string, markExplicit bool) error {
 	pid, alive := m.processStatus(name)
 	if !alive {
@@ -75,6 +93,9 @@ func (m *Manager) StopProcess(name string, markExplicit bool) error {
 	if err != nil {
 		return fmt.Errorf("failed to stop process %s with pid %d: %w", name, pid, err)
 	}
+	if markExplicit {
+		m.markExplicitlyStopped(name)
+	}
 	if err := syscall.Kill(-pgid, syscall.SIGTERM); err != nil {
 		return fmt.Errorf("failed to stop process %s with pid %d: %w", name, pid, err)
 	}
@@ -82,9 +103,6 @@ func (m *Manager) StopProcess(name string, markExplicit bool) error {
 		return err
 	}
 	m.freePortAfterStop(name)
-	if markExplicit {
-		m.markExplicitlyStopped(name)
-	}
 	return nil
 }
 
@@ -162,6 +180,7 @@ func (m *Manager) RestartProcess(name string) (int, error) {
 	}
 	if pid, alive := m.processStatus(name); alive {
 		if err := m.obliterateProcess(name, pid, true); err != nil {
+			m.clearExplicitStop(name)
 			return 0, err
 		}
 	}

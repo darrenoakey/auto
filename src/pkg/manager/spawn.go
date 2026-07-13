@@ -16,11 +16,15 @@ import (
 var transientSpawnErrnos = []error{syscall.EDEADLK, syscall.EAGAIN, syscall.ENOMEM}
 
 // spawnWithRetry launches `exec <command>` via /bin/sh in a new session and
-// returns the running process and its log path. It retries both spawn failure
-// shapes seen under heavy host load: the parent fork/exec raising a transient
-// errno, and the child shell's execve failing asynchronously (detected by a
-// transient marker in the log after the child dies within the grace period).
-func (m *Manager) spawnWithRetry(name, command, workdir string) (int, string, error) {
+// returns the running process and its log path. It retries spawn failure
+// shapes that are not the service's fault: the parent fork/exec raising a
+// transient errno, the child shell's execve failing asynchronously (detected
+// by a transient marker in the log after the child dies within the grace
+// period), and the child losing a TOCTOU race for its port (detected by an
+// address-in-use marker in the log), in which case the port is forced free
+// before retrying so the restart converges within this single call instead of
+// bouncing through the caller's crash-restart backoff.
+func (m *Manager) spawnWithRetry(name, command, workdir string, port *int) (int, string, error) {
 	wrapped := "exec " + command
 	var lastErr error
 	for attempt := 0; attempt < SpawnRetryAttempts; attempt++ {
@@ -36,6 +40,14 @@ func (m *Manager) spawnWithRetry(name, command, workdir string) (int, string, er
 		if childStillRunning(pid) {
 			reapWhenDone(pid)
 			return pid, logPath, nil
+		}
+		if logHasAddressInUse(logPath, offset) {
+			lastErr = fmt.Errorf("%s: lost a race for its port, retrying", name)
+			if port != nil {
+				forceFreePort(*port)
+			}
+			sleepSpawnBackoff(name, attempt)
+			continue
 		}
 		if !logHasTransientExecError(logPath, offset) {
 			return pid, logPath, nil // exited fast for a non-transient reason
@@ -122,20 +134,41 @@ func isTransientSpawnError(err error) bool {
 	return false
 }
 
-// logHasTransientExecError reports whether the portion of the log written by the
-// current spawn (from offset onward) contains a marker of an asynchronous
-// transient execve failure. Scoping to the spawn's own bytes avoids a stale
+// logTailSince returns the log content written from offset onward, or "" if
+// the log cannot be read. Scoping to the spawn's own bytes avoids a stale
 // marker from an earlier spawn the same day being read as this one's failure.
-func logHasTransientExecError(logPath string, offset int64) bool {
+func logTailSince(logPath string, offset int64) string {
 	raw, err := os.ReadFile(logPath)
 	if err != nil {
-		return false
+		return ""
 	}
 	if offset < 0 || offset > int64(len(raw)) {
 		offset = 0
 	}
-	text := string(raw[offset:])
+	return string(raw[offset:])
+}
+
+// logHasTransientExecError reports whether the portion of the log written by the
+// current spawn (from offset onward) contains a marker of an asynchronous
+// transient execve failure.
+func logHasTransientExecError(logPath string, offset int64) bool {
+	text := logTailSince(logPath, offset)
 	for _, marker := range transientExecMarkers {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// logHasAddressInUse reports whether the portion of the log written by the
+// current spawn (from offset onward) contains a marker of the child losing a
+// bind() race for its port. Matched case-insensitively since runtimes phrase
+// this differently (Go/BSD, Python's OSError, Node's EADDRINUSE, Rust's
+// "os error 48").
+func logHasAddressInUse(logPath string, offset int64) bool {
+	text := strings.ToLower(logTailSince(logPath, offset))
+	for _, marker := range addressInUseMarkers {
 		if strings.Contains(text, marker) {
 			return true
 		}
