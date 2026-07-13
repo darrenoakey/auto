@@ -4,6 +4,7 @@ import (
 	"net"
 	"os/exec"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -54,6 +55,23 @@ func freeEphemeralPort(t *testing.T) int {
 	port := ln.Addr().(*net.TCPAddr).Port
 	_ = ln.Close()
 	return port
+}
+
+// lsofPortPids returns the pids currently listening on a port, for tests that
+// need to assert exactly one survivor holds it after a race.
+func lsofPortPids(port int) []int {
+	out, err := exec.Command("lsof", "-ti", ":"+strconv.Itoa(port)).Output()
+	if err != nil || strings.TrimSpace(string(out)) == "" {
+		return nil
+	}
+	pids := make([]int, 0)
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		pid, perr := strconv.Atoi(strings.TrimSpace(line))
+		if perr == nil {
+			pids = append(pids, pid)
+		}
+	}
+	return pids
 }
 
 // waitForPortHeld polls until a port is in use or the timeout elapses.

@@ -1,6 +1,11 @@
 package manager
 
-import "testing"
+import (
+	"os/exec"
+	"strconv"
+	"testing"
+	"time"
+)
 
 func TestStartAndStopProcess(t *testing.T) {
 	m := newTestManager(t)
@@ -78,5 +83,91 @@ func TestRestartProcessGivesNewPid(t *testing.T) {
 	}
 	if m.isExplicitlyStopped("sleeper") {
 		t.Fatal("restarted process must not be marked explicitly stopped")
+	}
+}
+
+// TestStopProcessMarksExplicitBeforeKilling proves the TOCTOU fix directly: the
+// explicitly-stopped flag must already be true by the time any observer can see
+// the process as dead, so a concurrent WatchTick can never read the state as
+// "dead and not explicitly stopped" and race a competing respawn into the gap
+// while this call is still tearing the old instance down.
+func TestStopProcessMarksExplicitBeforeKilling(t *testing.T) {
+	m := newTestManager(t)
+	mustAdd(t, m, "sleeper", "sleep 300", nil)
+	pid, err := m.StartProcess("sleeper")
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = m.StopProcess("sleeper", true) })
+
+	done := make(chan bool)
+	go func() {
+		for isProcessAlive(pid) {
+			time.Sleep(time.Millisecond)
+		}
+		// pid just went dead: the explicit-stop flag must already be set.
+		done <- m.isExplicitlyStopped("sleeper")
+	}()
+
+	if err := m.StopProcess("sleeper", true); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if flagWasSet := <-done; !flagWasSet {
+		t.Fatal("process was observed dead before the explicitly-stopped flag was set — TOCTOU window for a concurrent WatchTick")
+	}
+}
+
+// TestRestartProcessNotRacedByWatchTick drives WatchTick concurrently with a
+// RestartProcess call and asserts the service converges to exactly one live
+// instance holding its port, with no competing instance left running.
+func TestRestartProcessNotRacedByWatchTick(t *testing.T) {
+	if _, err := exec.LookPath("nc"); err != nil {
+		t.Skip("nc unavailable")
+	}
+	m := newTestManager(t)
+	port := freeEphemeralPort(t)
+	mustAdd(t, m, "holder", "exec nc -l "+strconv.Itoa(port), &port)
+	first, err := m.StartProcess("holder")
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if !waitForPortHeld(port, 3*time.Second) {
+		t.Skip("nc did not bind the port (variant differs)")
+	}
+
+	stop := make(chan struct{})
+	tickDone := make(chan struct{})
+	go func() {
+		defer close(tickDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				m.WatchTick()
+				time.Sleep(2 * time.Millisecond)
+			}
+		}
+	}()
+
+	second, err := m.RestartProcess("holder")
+	close(stop)
+	<-tickDone
+	t.Cleanup(func() { _ = m.StopProcess("holder", true) })
+	if err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	if second == first {
+		t.Fatalf("restart should yield a new pid, both %d", first)
+	}
+	if !waitForPortHeld(port, 3*time.Second) {
+		t.Fatal("port should be held after restart")
+	}
+	holders := lsofPortPids(port)
+	if len(holders) != 1 || holders[0] != second {
+		t.Fatalf("expected exactly pid %d holding port %d, got %v", second, port, holders)
+	}
+	if pid, alive := m.Status("holder"); !alive || pid != second {
+		t.Fatalf("state should track the single survivor, got (%d,%v)", pid, alive)
 	}
 }
