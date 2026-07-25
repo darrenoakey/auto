@@ -6,6 +6,7 @@ package manager
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -59,7 +60,9 @@ var addressInUseMarkers = []string{
 // Manager owns a single auto project tree (state file + logs) rooted at root.
 // All operations are methods so tests can run against a temporary root.
 type Manager struct {
-	root string
+	root           string
+	logArchiveMu   sync.Mutex
+	logArchiveBusy bool
 }
 
 // New returns a Manager rooted at the given project directory.

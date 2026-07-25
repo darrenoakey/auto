@@ -89,6 +89,12 @@ auto log myapp --file
 
 Prints just the log file path.
 
+Process stdout/stderr go to a daily file
+`output/logs/<name>/YYYY/MM/<name>_YYYY-MM-DD.log`. Spawns the same day append
+to that file. The watch daemon zips previous-day (and older) plain logs to
+sibling `*.log.zip` archives in the background and deletes the plain file;
+today's live log is never archived.
+
 ### Update Process Settings
 
 ```bash

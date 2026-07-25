@@ -10,6 +10,7 @@ import (
 // backoff window. Fresh starts are rate-limited per tick so a post-reboot mass
 // start does not fire every spawn in a single instant.
 func (m *Manager) WatchTick() {
+	m.maybeArchiveOldLogs()
 	restarts := 0
 	for _, name := range m.definedNames() {
 		if _, alive := m.processStatus(name); alive {

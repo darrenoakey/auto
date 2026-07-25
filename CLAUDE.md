@@ -90,6 +90,15 @@ Transient host fork/exec failures (EDEADLK/EAGAIN/ENOMEM) and async execve death
 (transient markers in the log) are retried. Surviving children get a `Wait4` reaper
 goroutine so the long-lived daemon never accumulates zombies.
 
+### Daily log zip
+Each `WatchTick` kicks a background pass that zips previous-day (and older)
+`.log` files to sibling `*.log.zip` archives and removes the plain file. Today's
+live daily log is never touched. Work is budgeted (`MaxLogArchivesPerWatchTick`)
+so a multi-GB backlog cannot stall crash supervision; successive ticks drain the
+rest. Zips are written atomically (temp + rename); a partial prior run that left
+both plain log and zip recovers by dropping the plain file when the zip is good.
+Legacy timestamped logs (pre-daily-roll) are archived by mtime before today.
+
 ### Shutdown vs reload
 - System shutdown sends SIGTERM → the watch loop tears down all managed processes
   cleanly (NOT marked explicitly stopped → they restart next boot).
