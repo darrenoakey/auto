@@ -25,6 +25,15 @@ type Process struct {
 	LogPath                string   `json:"log_path,omitempty"`
 	RestartIntervalSeconds *int     `json:"restart_interval_seconds,omitempty"`
 	LastPeriodicRestart    *float64 `json:"last_periodic_restart,omitempty"`
+	// StartingSince marks a start that has been committed to but whose pid is
+	// not recorded yet. Spawning is slow (spawn retries plus SpawnVerifyDelay),
+	// and for that whole window the entry still reads Pid=nil, which the watch
+	// loop would otherwise treat as "dead and not explicitly stopped" and start
+	// a competing second copy. Written under the state lock BEFORE the spawn —
+	// the same ordering StopProcess uses for ExplicitlyStopped — and cleared
+	// when the start succeeds or fails. Omitted from JSON when unset, so
+	// existing state files load unchanged.
+	StartingSince *float64 `json:"starting_since,omitempty"`
 }
 
 // stateFile is the top-level shape of state.json.

@@ -71,6 +71,13 @@ type Manager struct {
 	logArchiveLast    time.Time
 	logArchiveBacklog bool
 
+	// procTable is the process-table snapshot serving the watch tick currently
+	// in flight, or nil outside a tick (and immediately after any spawn, which
+	// invalidates it). See proctable.go: it collapses two `ps` forks per
+	// managed service per tick into one for the whole tick.
+	procTableMu sync.Mutex
+	procTable   *procTable
+
 	// stateCache memoizes the parsed state file for read-only callers. The watch
 	// loop issues many per-service reads per tick; without this cache each one
 	// re-read and re-parsed the whole file (~200 os.ReadFile+json.Unmarshal

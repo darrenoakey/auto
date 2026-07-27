@@ -33,24 +33,80 @@ func (m *Manager) StartProcess(name string) (int, error) {
 	if afterPortCheckHook != nil && def.Port != nil {
 		afterPortCheckHook(*def.Port)
 	}
+	// Claim the start before spawning: for the whole spawn window the entry
+	// still has Pid=nil, and a concurrent WatchTick reading that would start a
+	// competing copy (observed: `auto add` and the watch loop each spawning one
+	// canary, orphaning the CLI's). Both read state only through the lock, so
+	// once this write lands the loop can never see an unclaimed dead entry.
+	if !m.claimStart(name) {
+		return 0, fmt.Errorf("process %s is already starting", name)
+	}
 	pid, logPath, err := m.spawnWithRetry(name, def.Command, def.Workdir, def.Port)
 	if err != nil {
+		m.clearStartClaim(name)
 		return 0, err
 	}
 	m.recordStarted(name, pid, logPath)
 	return pid, nil
 }
 
+// StartInFlightTTL bounds how long a start claim suppresses supervision. A
+// claim is normally cleared within a second, but the claiming process can die
+// mid-spawn (a CLI killed, or the daemon torn down by `auto install`), and a
+// stale claim must never wedge a service out of supervision permanently. The
+// TTL sits comfortably above the worst-case spawn budget
+// (SpawnRetryAttempts * SpawnRetryBaseDelay * attempts + SpawnVerifyDelay).
+const StartInFlightTTL = 60 * time.Second
+
+// claimStart records that a start is in flight, returning false if another
+// start already holds a live claim.
+func (m *Manager) claimStart(name string) bool {
+	claimed := false
+	m.withState(func(data *stateFile) bool {
+		p, ok := data.Processes[name]
+		if !ok || startClaimIsLive(p) {
+			return false
+		}
+		now := nowUnix()
+		p.StartingSince = &now
+		claimed = true
+		return true
+	})
+	return claimed
+}
+
+// clearStartClaim releases an in-flight start claim.
+func (m *Manager) clearStartClaim(name string) {
+	m.mutateProcess(name, func(p *Process) { p.StartingSince = nil })
+}
+
+// startClaimIsLive reports whether a start claim is present and still within
+// StartInFlightTTL. An expired claim is ignored so a claimant that died
+// mid-spawn cannot suppress supervision forever.
+func startClaimIsLive(p *Process) bool {
+	if p == nil || p.StartingSince == nil {
+		return false
+	}
+	return nowUnix()-*p.StartingSince < StartInFlightTTL.Seconds()
+}
+
 // recordStarted writes the runtime fields of a freshly started process,
 // preserving its restart bookkeeping. If the definition vanished mid-start
 // (concurrently removed) it records nothing rather than recreating a stub.
+//
+// It is the single choke point for every new pid, so it also drops any
+// per-tick process-table snapshot: that snapshot predates this spawn and would
+// report the new pid as dead, which could restart a service twice in one tick.
+// Later lookups in the tick fall back to querying `ps` directly.
 func (m *Manager) recordStarted(name string, pid int, logPath string) {
 	st := processStartTime(pid)
+	m.setProcSnapshot(nil)
 	m.mutateProcess(name, func(p *Process) {
 		p.Pid = &pid
 		p.StartTime = &st
 		p.ExplicitlyStopped = false
 		p.LogPath = logPath
+		p.StartingSince = nil // the pid is recorded; supervision may resume
 	})
 }
 

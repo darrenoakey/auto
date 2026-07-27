@@ -11,6 +11,11 @@ import (
 // start does not fire every spawn in a single instant.
 func (m *Manager) WatchTick() {
 	m.maybeArchiveOldLogs()
+	// One process-table snapshot serves every processStatus call in this tick.
+	// Without it each managed service cost two `ps` forks per tick (state +
+	// lstart), so ~40 services meant ~80 fork+execs every second.
+	m.setProcSnapshot(newProcTable())
+	defer m.setProcSnapshot(nil)
 	restarts := 0
 	for _, name := range m.definedNames() {
 		if _, alive := m.processStatus(name); alive {

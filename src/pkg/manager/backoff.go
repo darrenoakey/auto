@@ -71,6 +71,11 @@ func (m *Manager) shouldRestart(name string) bool {
 	}
 	data := m.loadStateFile()
 	p, ok := data.Processes[name]
+	// A start already in flight owns this process: its pid is not recorded yet,
+	// so the entry reads dead, but starting it again would spawn a second copy.
+	if ok && startClaimIsLive(p) {
+		return false
+	}
 	if !ok || p.LastRestartTime == nil {
 		return true
 	}
