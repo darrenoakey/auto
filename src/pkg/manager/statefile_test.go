@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // seedState writes raw JSON to the manager's state path, creating the directory.
@@ -119,5 +120,50 @@ func TestLoadStateFileFreshWhenMissing(t *testing.T) {
 	data := m.loadStateFile()
 	if data.Processes == nil || len(data.Processes) != 0 {
 		t.Fatalf("expected empty fresh state, got %+v", data.Processes)
+	}
+}
+
+// TestLoadStateFileCachesReadsAndInvalidatesOnWrite guards the read cache that
+// keeps the watch daemon from re-reading and re-parsing state.json on every
+// per-service call. It must (a) serve repeated unchanged reads from one shared
+// snapshot, (b) invalidate after a withState mutation, and (c) invalidate after
+// an external rewrite of state.json (a CLI invocation in another process).
+func TestLoadStateFileCachesReadsAndInvalidatesOnWrite(t *testing.T) {
+	m := newTestManager(t)
+	mustAdd(t, m, "svc", "sleep 1", nil)
+
+	// (a) Repeated read-only loads with no intervening write share one snapshot.
+	first := m.loadStateFile()
+	second := m.loadStateFile()
+	if first != second {
+		t.Fatalf("consecutive reads returned different snapshots; cache is not memoizing")
+	}
+
+	// (b) A mutation through withState must invalidate the cache: the next read
+	// returns a fresh snapshot reflecting the write, not the stale pointer.
+	m.mutateProcess("svc", func(p *Process) { p.Command = "sleep 2" })
+	third := m.loadStateFile()
+	if third == first {
+		t.Fatalf("cache not invalidated after withState write; still serving stale snapshot")
+	}
+	if got := third.Processes["svc"].Command; got != "sleep 2" {
+		t.Fatalf("after write, got command %q, want %q", got, "sleep 2")
+	}
+
+	// (c) A direct rewrite of state.json (as a separate CLI process would do)
+	// must invalidate via the mtime/size change, even though this Manager never
+	// observed the write through saveStateFile. Force a distinct mtime so the
+	// change is observable regardless of filesystem timestamp granularity.
+	external := `{"processes":{"svc":{"command":"sleep 3"}}}`
+	if err := os.WriteFile(m.statePath(), []byte(external), 0o644); err != nil {
+		t.Fatalf("external write: %v", err)
+	}
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(m.statePath(), future, future); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	fourth := m.loadStateFile()
+	if got := fourth.Processes["svc"].Command; got != "sleep 3" {
+		t.Fatalf("external write not picked up: got command %q, want %q", got, "sleep 3")
 	}
 }

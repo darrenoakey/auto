@@ -19,7 +19,7 @@ import (
 func (m *Manager) withState(mutate func(*stateFile) bool) {
 	unlock := m.lockState()
 	defer unlock()
-	data := m.loadStateFile()
+	data := m.loadStateFresh() // mutator: always read latest committed state, bypassing the read cache
 	if mutate(data) {
 		m.saveStateFile(data)
 	}

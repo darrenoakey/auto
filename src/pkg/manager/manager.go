@@ -63,6 +63,24 @@ type Manager struct {
 	root           string
 	logArchiveMu   sync.Mutex
 	logArchiveBusy bool
+
+	// stateCache memoizes the parsed state file for read-only callers. The watch
+	// loop issues many per-service reads per tick; without this cache each one
+	// re-read and re-parsed the whole file (~200 os.ReadFile+json.Unmarshal
+	// calls per second with ~50 services), which was the daemon's entire CPU
+	// footprint. The cached *stateFile is shared read-only memory: every
+	// mutation goes through withState -> loadStateFresh -> saveStateFile, and
+	// saveStateFile bumps stateCacheGen to invalidate the snapshot. A write by a
+	// concurrent CLI invocation (a separate process with its own Manager) is
+	// detected by a stat mtime/size change, so the cache self-heals within one
+	// tick.
+	stateCacheMu       sync.Mutex
+	stateCache         *stateFile
+	stateCacheExists   bool
+	stateCacheMtime    time.Time
+	stateCacheSize     int64
+	stateCacheGen      int64 // bumped on every saveStateFile (own write)
+	stateCacheSavedGen int64 // gen of the disk content the cache reflects
 }
 
 // New returns a Manager rooted at the given project directory.
