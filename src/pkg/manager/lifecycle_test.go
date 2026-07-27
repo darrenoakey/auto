@@ -3,6 +3,7 @@ package manager
 import (
 	"os/exec"
 	"strconv"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -52,11 +53,63 @@ func TestStartProcessUnknownFails(t *testing.T) {
 	}
 }
 
-func TestStopProcessNotRunningFails(t *testing.T) {
+func TestStopProcessDeadRegisteredServicePersistsExplicitStop(t *testing.T) {
 	m := newTestManager(t)
 	mustAdd(t, m, "sleeper", "sleep 300", nil)
-	if err := m.StopProcess("sleeper", true); err == nil {
-		t.Fatal("stopping a non-running process should fail")
+	pid, err := m.StartProcess("sleeper")
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	killGroup(t, pid)
+	waitForActualProcessDeath(t, pid)
+
+	if err := m.StopProcess("sleeper", true); err != nil {
+		t.Fatalf("stop dead registered service: %v", err)
+	}
+	reopened := New(m.Root())
+	process := reopened.loadStateFile().Processes["sleeper"]
+	if process == nil || !process.ExplicitlyStopped {
+		t.Fatal("explicit stop did not persist after reopening manager")
+	}
+	if process.Pid != nil || process.StartTime != nil || process.StartingSince != nil {
+		t.Fatalf("stale runtime identity persisted: %+v", process)
+	}
+	if results := reopened.RestartDead(); len(results) != 0 {
+		t.Fatalf("RestartDead respawned explicitly stopped service: %v", results)
+	}
+	if _, alive := reopened.Status("sleeper"); alive {
+		t.Fatal("explicitly stopped service should remain dead")
+	}
+}
+
+func TestStopProcessUnknownFailsWithoutCreatingState(t *testing.T) {
+	m := newTestManager(t)
+	if err := m.StopProcess("ghost", true); err == nil {
+		t.Fatal("stopping an unknown process should fail")
+	}
+	if _, exists := m.loadStateFile().Processes["ghost"]; exists {
+		t.Fatal("stopping an unknown process created a state entry")
+	}
+}
+
+// waitForActualProcessDeath synchronizes on the real process table without
+// fixed-duration sleeps.
+func waitForActualProcessDeath(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.NewTimer(SigkillTimeout)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	t.Cleanup(func() { deadline.Stop() })
+	t.Cleanup(func() { ticker.Stop() })
+	for {
+		select {
+		case <-ticker.C:
+			if !isProcessAlive(pid) {
+				return
+			}
+		case <-deadline.C:
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+			t.Fatalf("pid %d did not die", pid)
+		}
 	}
 }
 

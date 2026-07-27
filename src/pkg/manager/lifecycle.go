@@ -141,9 +141,12 @@ func waitForProcessDeath(pid int, timeout time.Duration) bool {
 // stopped" and race a competing respawn into the gap while this call is still
 // tearing the old instance down.
 func (m *Manager) StopProcess(name string, markExplicit bool) error {
+	if _, ok := m.definition(name); !ok {
+		return fmt.Errorf("process %s not found in config", name)
+	}
 	pid, alive := m.processStatus(name)
 	if !alive {
-		return fmt.Errorf("process %s is not running", name)
+		return m.stopDeadProcess(name, markExplicit)
 	}
 	pgid, err := syscall.Getpgid(pid)
 	if err != nil {
@@ -152,14 +155,30 @@ func (m *Manager) StopProcess(name string, markExplicit bool) error {
 	if markExplicit {
 		m.markExplicitlyStopped(name)
 	}
+	if err := m.terminateProcessGroup(name, pid, pgid); err != nil {
+		return err
+	}
+	m.clearRuntimeIdentity(name)
+	m.freePortAfterStop(name)
+	return nil
+}
+
+// stopDeadProcess makes an explicit stop durable when process death won the
+// race with the user's stop request.
+func (m *Manager) stopDeadProcess(name string, markExplicit bool) error {
+	if !markExplicit {
+		return fmt.Errorf("process %s is not running", name)
+	}
+	m.persistStoppedRuntime(name)
+	return nil
+}
+
+// terminateProcessGroup signals a live process group and verifies its death.
+func (m *Manager) terminateProcessGroup(name string, pid, pgid int) error {
 	if err := syscall.Kill(-pgid, syscall.SIGTERM); err != nil {
 		return fmt.Errorf("failed to stop process %s with pid %d: %w", name, pid, err)
 	}
-	if err := m.escalateKill(name, pid, pgid); err != nil {
-		return err
-	}
-	m.freePortAfterStop(name)
-	return nil
+	return m.escalateKill(name, pid, pgid)
 }
 
 // escalateKill waits for SIGTERM to take effect, escalating to SIGKILL and
@@ -188,6 +207,27 @@ func (m *Manager) freePortAfterStop(name string) {
 // markExplicitlyStopped sets the explicitly-stopped flag.
 func (m *Manager) markExplicitlyStopped(name string) {
 	m.mutateProcess(name, func(p *Process) { p.ExplicitlyStopped = true })
+}
+
+// persistStoppedRuntime records an explicit stop and removes stale ownership
+// fields when no live owned process remains.
+func (m *Manager) persistStoppedRuntime(name string) {
+	m.mutateProcess(name, func(p *Process) {
+		p.ExplicitlyStopped = true
+		resetRuntimeIdentity(p)
+	})
+}
+
+// clearRuntimeIdentity removes ownership fields after process death.
+func (m *Manager) clearRuntimeIdentity(name string) {
+	m.mutateProcess(name, resetRuntimeIdentity)
+}
+
+// resetRuntimeIdentity removes runtime ownership from one process entry.
+func resetRuntimeIdentity(process *Process) {
+	process.Pid = nil
+	process.StartTime = nil
+	process.StartingSince = nil
 }
 
 // clearExplicitStop clears the explicitly-stopped flag so the watch loop may

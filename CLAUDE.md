@@ -12,6 +12,11 @@ The `run` script (bash facade) is the only entry point for builds:
 
 - `./run build` — compile `cmd/*` and assemble + **code-sign** `output/Auto.app`.
 - `./run check` — full quality gate: `gofmt`, `go vet`, `golangci-lint`, all tests.
+- `./run deploy` — canonical-checkout-only production deploy: rebuild/sign the
+  bundle, SIGKILL only launchd's exact watcher PID, wait for KeepAlive to spawn a
+  fresh watcher, then run `health`. Managed services are intentionally untouched.
+- `./run health` — prove the launchd watcher runs the canonical signed binary and
+  that the signed CLI completes a functional `-q ps`.
 - `./run install` (= `rebuild`) — build, sign, and (re)load the LaunchAgent.
 - `./run logs` — tail the live daemon log.
 - Any other verb is passed straight to the signed binary (`./run ps`, etc.).

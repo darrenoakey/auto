@@ -14,6 +14,9 @@ TEST_DIR="$OUTPUT_DIR/testing"
 APP_BUNDLE="$OUTPUT_DIR/Auto.app"
 APP_EXE="$APP_BUNDLE/Contents/MacOS/auto"
 BUNDLE_ID="com.darrenoakey.auto"
+LAUNCH_AGENT_LABEL="com.darrenoakey.auto"
+LAUNCH_AGENT_TARGET="gui/$(id -u)/$LAUNCH_AGENT_LABEL"
+CANONICAL_DIR="/Users/darrenoakey/local/auto"
 
 mkdir -p "$BIN_DIR" "$TEST_DIR"
 
@@ -25,6 +28,8 @@ usage() {
     echo "  test [pkg] [args]  Run tests for a package"
     echo "  lint               Run gofmt, go vet, and golangci-lint"
     echo "  check              Full quality gate (lint + all tests)"
+    echo "  deploy             Rebuild and replace only the production watch daemon"
+    echo "  health             Verify the production watcher and signed CLI"
     echo "  install            Build, sign, and (re)load the Auto LaunchAgent"
     echo "  rebuild            Alias for install"
     echo "  logs               Tail the live auto daemon log"
@@ -131,6 +136,77 @@ cmd_install() {
     "$APP_EXE" -q install
 }
 
+watcher_pid() {
+    local details pid
+    details="$(launchctl print "$LAUNCH_AGENT_TARGET" 2>/dev/null)" || return 1
+    pid="$(awk '/^[[:space:]]*pid = [0-9]+/{print $3; exit}' <<<"$details")"
+    if [[ ! "$pid" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+    echo "$pid"
+}
+
+watcher_uses_canonical_binary() {
+    local pid="$1" command_line
+    command_line="$(ps -p "$pid" -o command= 2>/dev/null)" || return 1
+    [ "$command_line" = "$APP_EXE watch" ]
+}
+
+cmd_health() {
+    local pid process_list
+    [ "$SCRIPT_DIR" = "$CANONICAL_DIR" ] || {
+        echo "FAIL: health must run from canonical checkout $CANONICAL_DIR" >&2
+        return 1
+    }
+    codesign --verify --deep --strict "$APP_BUNDLE"
+    pid="$(watcher_pid)" || {
+        echo "FAIL: LaunchAgent watcher is not running" >&2
+        return 1
+    }
+    watcher_uses_canonical_binary "$pid" || {
+        echo "FAIL: watcher pid $pid is not executing $APP_EXE watch" >&2
+        return 1
+    }
+    process_list="$("$APP_EXE" -q ps)" || {
+        echo "FAIL: signed CLI could not execute functional ps" >&2
+        return 1
+    }
+    [[ "$process_list" == NAME*"PID"*"PORT"*"RESTART"* ]] || {
+        echo "FAIL: signed CLI ps returned an invalid process listing" >&2
+        return 1
+    }
+    echo "==> Healthy: watcher pid $pid; signed CLI ps succeeded."
+}
+
+cmd_deploy() {
+    local old_pid new_pid attempt
+    [ "$SCRIPT_DIR" = "$CANONICAL_DIR" ] || {
+        echo "FAIL: deploy must run from canonical checkout $CANONICAL_DIR" >&2
+        return 1
+    }
+    cmd_build
+    old_pid="$(watcher_pid)" || {
+        echo "FAIL: cannot safely replace a watcher that launchd is not running" >&2
+        return 1
+    }
+    watcher_uses_canonical_binary "$old_pid" || {
+        echo "FAIL: refusing to kill unexpected watcher pid $old_pid" >&2
+        return 1
+    }
+    /bin/kill -KILL "$old_pid"
+    for attempt in {1..300}; do
+        new_pid="$(watcher_pid 2>/dev/null || true)"
+        if [ -n "$new_pid" ] && [ "$new_pid" != "$old_pid" ] && watcher_uses_canonical_binary "$new_pid"; then
+            cmd_health
+            echo "==> Deploy complete: watcher $old_pid replaced by $new_pid."
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "FAIL: launchd did not start a fresh Auto watcher within 30 seconds" >&2
+    return 1
+}
+
 LA_LOG="$SCRIPT_DIR/output/logs/auto/auto.log"
 
 cmd_logs() {
@@ -157,6 +233,8 @@ case "${1:-}" in
     test)    shift; cmd_test "$@" ;;
     lint)    shift; cmd_lint "$@" ;;
     check)   shift; cmd_check "$@" ;;
+    deploy)  shift; cmd_deploy "$@" ;;
+    health)  shift; cmd_health "$@" ;;
     install) shift; cmd_install "$@" ;;
     rebuild) shift; cmd_install "$@" ;;
     logs)    shift; cmd_logs "$@" ;;
