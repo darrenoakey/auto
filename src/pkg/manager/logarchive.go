@@ -15,13 +15,24 @@ const (
 	// MaxLogArchivesPerWatchTick bounds how many old .log files one watch tick
 	// may zip, so a multi-gigabyte backlog cannot stall crash supervision.
 	MaxLogArchivesPerWatchTick = 40
+
+	// LogArchiveInterval bounds how often an idle log tree is re-walked. A pass
+	// costs a full filepath.WalkDir of the log tree, which grows without bound
+	// (one dir per service per month, one .log.zip per service per day: ~76k
+	// files / 878 dirs on the author's box). New work only appears at a local
+	// day boundary, but the watch loop ticks once per second, so walking on
+	// every tick burned ~28% of a core forever to discover nothing to do. A
+	// pass that finds a backlog is repeated immediately; an idle one waits for
+	// the day to roll or this interval to elapse, whichever comes first.
+	LogArchiveInterval = time.Hour
 )
 
 // maybeArchiveOldLogs zips previous-day (and older) process logs in the
-// background at most once at a time. Today's live daily log is never touched.
+// background at most once at a time, and only when a pass is actually due
+// (see logArchiveDueLocked). Today's live daily log is never touched.
 func (m *Manager) maybeArchiveOldLogs() {
 	m.logArchiveMu.Lock()
-	if m.logArchiveBusy {
+	if m.logArchiveBusy || !m.logArchiveDueLocked(time.Now()) {
 		m.logArchiveMu.Unlock()
 		return
 	}
@@ -30,16 +41,36 @@ func (m *Manager) maybeArchiveOldLogs() {
 	go m.runLogArchivePass()
 }
 
-// runLogArchivePass drains a budgeted batch of old logs, then clears the busy
-// flag so a later tick can continue the backlog.
+// logArchiveDueLocked reports whether a walk of the log tree is worth doing
+// now. Callers must hold logArchiveMu.
+//
+// A pass is due when the daemon has not walked since boot, when the previous
+// pass exhausted its budget (a backlog is still draining, so keep going), when
+// the local calendar day has rolled since the last pass (today's logs just
+// became archivable), or when LogArchiveInterval has elapsed as a backstop for
+// logs that arrive by other means.
+func (m *Manager) logArchiveDueLocked(now time.Time) bool {
+	if m.logArchiveLast.IsZero() || m.logArchiveBacklog {
+		return true
+	}
+	if !startOfLocalDay(now).Equal(startOfLocalDay(m.logArchiveLast)) {
+		return true
+	}
+	return !now.Before(m.logArchiveLast.Add(LogArchiveInterval))
+}
+
+// runLogArchivePass drains a budgeted batch of old logs, then records when the
+// pass ran and whether it hit its budget, and clears the busy flag so a later
+// tick can continue the backlog.
 func (m *Manager) runLogArchivePass() {
-	defer func() {
-		m.logArchiveMu.Lock()
-		m.logArchiveBusy = false
-		m.logArchiveMu.Unlock()
-	}()
-	if n := m.archiveOldLogs(MaxLogArchivesPerWatchTick); n > 0 {
-		fmt.Printf("Archived %d old log file(s) to zip\n", n)
+	archived := m.archiveOldLogs(MaxLogArchivesPerWatchTick)
+	m.logArchiveMu.Lock()
+	m.logArchiveLast = time.Now()
+	m.logArchiveBacklog = archived >= MaxLogArchivesPerWatchTick
+	m.logArchiveBusy = false
+	m.logArchiveMu.Unlock()
+	if archived > 0 {
+		fmt.Printf("Archived %d old log file(s) to zip\n", archived)
 	}
 }
 

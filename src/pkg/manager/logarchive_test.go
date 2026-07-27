@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -144,6 +145,135 @@ func TestWatchTickArchivesOldLogs(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("watch archive pass did not zip %s in time", oldPath)
+}
+
+// TestWatchTickDoesNotRewalkIdleLogTree pins the CPU fix: a pass that finds no
+// backlog must not be repeated on the very next one-second tick. Walking the
+// log tree costs a full filepath.WalkDir (~76k files on a live box), so an
+// unconditional per-tick pass burned ~28% of a core to discover nothing to do.
+func TestWatchTickDoesNotRewalkIdleLogTree(t *testing.T) {
+	m := newTestManager(t)
+	// An idle tree: only today's live log, which is never archivable.
+	writeNamedLog(t, m, "svc", time.Now().Format("2006-01-02"), "live\n")
+
+	m.WatchTick()
+	waitForArchivePass(t, m)
+	first := m.logArchiveLastForTest()
+	if first.IsZero() {
+		t.Fatal("first watch tick must run an archive pass")
+	}
+
+	for i := 0; i < 5; i++ {
+		m.WatchTick()
+	}
+	waitForArchivePass(t, m)
+	if got := m.logArchiveLastForTest(); !got.Equal(first) {
+		t.Fatalf("idle log tree was re-walked by a later tick: last pass moved %v -> %v", first, got)
+	}
+}
+
+// TestLogArchiveDueRunsAgainOnBacklogDayRollAndInterval pins the three
+// conditions that must still trigger a pass, so rate-limiting cannot strand a
+// backlog or miss the day boundary where new logs become archivable.
+func TestLogArchiveDueRunsAgainOnBacklogDayRollAndInterval(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name     string
+		last     time.Time
+		backlog  bool
+		wantDue  bool
+		checkNow time.Time
+	}{
+		{"never run", time.Time{}, false, true, now},
+		{"just ran, idle", now, false, false, now},
+		{"budget exhausted", now, true, true, now},
+		{"day rolled", now.AddDate(0, 0, -1), false, true, now},
+		{"interval elapsed", now.Add(-LogArchiveInterval), false, true, now},
+		{"inside interval", now.Add(-LogArchiveInterval / 2), false, false, now},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newTestManager(t)
+			m.logArchiveLast = tc.last
+			m.logArchiveBacklog = tc.backlog
+			if got := m.logArchiveDueLocked(tc.checkNow); got != tc.wantDue {
+				t.Fatalf("logArchiveDueLocked = %v, want %v", got, tc.wantDue)
+			}
+		})
+	}
+}
+
+// TestLogArchiveBacklogDrainsAcrossTicks pins that a budget-exhausting pass
+// keeps running on subsequent ticks until the backlog is gone, and only then
+// settles into the rate-limited idle state.
+func TestLogArchiveBacklogDrainsAcrossTicks(t *testing.T) {
+	m := newTestManager(t)
+	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+	total := MaxLogArchivesPerWatchTick + 5
+	for i := 0; i < total; i++ {
+		writeNamedLog(t, m, fmt.Sprintf("svc%03d", i), yesterday, "body\n")
+	}
+
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		m.WatchTick()
+		waitForArchivePass(t, m)
+		if countPlainLogs(t, m.logDir()) == 0 {
+			break
+		}
+	}
+	if n := countPlainLogs(t, m.logDir()); n != 0 {
+		t.Fatalf("backlog did not drain across ticks: %d plain logs left", n)
+	}
+
+	m.logArchiveMu.Lock()
+	backlog := m.logArchiveBacklog
+	m.logArchiveMu.Unlock()
+	if backlog {
+		t.Fatal("drained backlog must clear logArchiveBacklog so the tree stops being re-walked")
+	}
+}
+
+// logArchiveLastForTest returns when the last archive pass completed.
+func (m *Manager) logArchiveLastForTest() time.Time {
+	m.logArchiveMu.Lock()
+	defer m.logArchiveMu.Unlock()
+	return m.logArchiveLast
+}
+
+// waitForArchivePass blocks until no archive pass is in flight.
+func waitForArchivePass(t *testing.T, m *Manager) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		m.logArchiveMu.Lock()
+		busy := m.logArchiveBusy
+		m.logArchiveMu.Unlock()
+		if !busy {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("archive pass did not finish in time")
+}
+
+// countPlainLogs returns how many unarchived *.log files remain under dir.
+func countPlainLogs(t *testing.T, dir string) int {
+	t.Helper()
+	count := 0
+	err := filepath.WalkDir(dir, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil || entry.IsDir() {
+			return nil //nolint:nilerr // a partially built tree is not a test failure
+		}
+		if isPlainLogFile(path, entry) {
+			count++
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", dir, err)
+	}
+	return count
 }
 
 // writeNamedLog creates a daily-named log with the given date suffix and body.

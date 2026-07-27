@@ -60,9 +60,16 @@ var addressInUseMarkers = []string{
 // Manager owns a single auto project tree (state file + logs) rooted at root.
 // All operations are methods so tests can run against a temporary root.
 type Manager struct {
-	root           string
-	logArchiveMu   sync.Mutex
-	logArchiveBusy bool
+	root string
+
+	// logArchiveMu guards the log-archive pass scheduling state below.
+	// logArchiveBusy prevents overlapping passes; logArchiveLast and
+	// logArchiveBacklog rate-limit them, so an idle log tree is not re-walked
+	// on every one-second watch tick (see logArchiveDueLocked).
+	logArchiveMu      sync.Mutex
+	logArchiveBusy    bool
+	logArchiveLast    time.Time
+	logArchiveBacklog bool
 
 	// stateCache memoizes the parsed state file for read-only callers. The watch
 	// loop issues many per-service reads per tick; without this cache each one
