@@ -33,14 +33,15 @@ grant never stuck and the app never appeared in System Settings.
 
 The fix is structural:
 - `Auto.app` is a real bundle with `CFBundleIdentifier`,
-  `NSLocalNetworkUsageDescription`, and `NSRemindersUsageDescription`, signed with
-  a **stable** Apple Development identity (TCC keys on Team ID + bundle id,
-  constant across rebuilds — see `~/src/sparkview`).
+  `NSLocalNetworkUsageDescription`, `NSRemovableVolumesUsageDescription`, and
+  `NSRemindersUsageDescription`, signed with a **stable** Apple Development
+  identity (TCC keys on Team ID + bundle id, constant across rebuilds - see
+  `~/src/sparkview`).
 - launchd execs the signed binary **directly** (`ProgramArguments` =
   `Auto.app/Contents/MacOS/auto watch`), so `auto` is its OWN responsible process.
-- Every service `auto` spawns inherits `auto` as the responsible process, so **one**
-  Local Network grant (made once in System Settings → Privacy & Security → Local
-  Network) covers all managed services, and it persists across rebuilds.
+- Every service `auto` spawns inherits `auto` as the responsible process, so one
+  grant for each protected resource covers all managed services. Local Network
+  and Files & Folders -> Removable Volumes grants persist across rebuilds.
 
 A child must be spawned **by the launchd daemon** to inherit auto's identity.
 A service spawned by a terminal `auto start` is attributed to the terminal instead.

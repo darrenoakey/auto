@@ -1,7 +1,10 @@
 package main
 
 import (
+	"os"
+	"os/exec"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -26,5 +29,25 @@ func TestToSet(t *testing.T) {
 func TestRunWithNoArgsReturnsUsageCode(t *testing.T) {
 	if code := run(nil); code != 2 {
 		t.Fatalf("run(nil) = %d, want 2", code)
+	}
+}
+
+func TestBundleDeclaresRemovableVolumePurpose(t *testing.T) {
+	const plistPath = "bundle/Info.plist"
+	if _, err := os.Stat(plistPath); err != nil {
+		t.Fatalf("stat bundle metadata: %v", err)
+	}
+	output, err := exec.Command(
+		"plutil",
+		"-extract", "NSRemovableVolumesUsageDescription",
+		"raw",
+		"-o", "-",
+		plistPath,
+	).CombinedOutput()
+	if err != nil {
+		t.Fatalf("read removable-volume purpose: %v: %s", err, output)
+	}
+	if purpose := strings.TrimSpace(string(output)); !strings.Contains(purpose, "model data") {
+		t.Fatalf("removable-volume purpose = %q, want model-data explanation", purpose)
 	}
 }
