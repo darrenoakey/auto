@@ -2,14 +2,20 @@ package manager
 
 import (
 	"fmt"
+	"os"
 	"time"
 )
 
-// WatchTick performs one supervision pass: it resets backoff and applies periodic
-// restarts for running processes, and restarts dead ones that are past their
-// backoff window. Fresh starts are rate-limited per tick so a post-reboot mass
-// start does not fire every spawn in a single instant.
+// WatchTick performs one supervision pass: it fulfills any delegated spawn
+// requests left by external CLI invocations (see delegateSpawnToDaemon in
+// lifecycle.go — only the daemon's own process may fork/exec a managed
+// service), resets backoff and applies periodic restarts for running
+// processes, and restarts dead ones that are past their backoff window.
+// Fresh crash-restarts are rate-limited per tick so a post-reboot mass start
+// does not fire every spawn in a single instant; a fulfilled spawn request
+// counts toward the same per-tick cap since it performs an identical spawn.
 func (m *Manager) WatchTick() {
+	m.recordHeartbeat()
 	m.maybeArchiveOldLogs()
 	// One process-table snapshot serves every processStatus call in this tick.
 	// Without it each managed service cost two `ps` forks per tick (state +
@@ -18,6 +24,10 @@ func (m *Manager) WatchTick() {
 	defer m.setProcSnapshot(nil)
 	restarts := 0
 	for _, name := range m.definedNames() {
+		if restarts < MaxRestartsPerWatchTick && m.fulfillSpawnRequest(name) {
+			restarts++
+			continue
+		}
 		if _, alive := m.processStatus(name); alive {
 			m.superviseRunning(name)
 			continue
@@ -29,6 +39,54 @@ func (m *Manager) WatchTick() {
 			restarts++
 		}
 	}
+}
+
+// recordHeartbeat marks this process as the live watch daemon for this state
+// file. liveDaemon (lifecycle.go) reads it to decide whether StartProcess
+// should delegate a spawn here rather than forking directly from an external
+// CLI caller.
+func (m *Manager) recordHeartbeat() {
+	m.withState(func(data *stateFile) bool {
+		now := nowUnix()
+		pid := os.Getpid()
+		data.DaemonHeartbeat = &now
+		data.DaemonPid = &pid
+		return true
+	})
+}
+
+// fulfillSpawnRequest performs a pending delegated spawn request for name, if
+// one is live. It is the daemon-side half of delegateSpawnToDaemon: only the
+// watch daemon's own process calls this, so the resulting child always
+// inherits Auto.app's macOS responsible-process identity regardless of which
+// external CLI invocation asked for it. Returns true if it performed a spawn
+// this tick (the caller should skip normal dead-process supervision for name
+// in the same tick, since this already resolved it).
+func (m *Manager) fulfillSpawnRequest(name string) bool {
+	def, ok := m.definition(name)
+	if !ok || def.SpawnRequestedAt == nil {
+		return false
+	}
+	if !isSpawnRequestLive(def) {
+		// Abandoned: the requester gave up (or died) before we reached it.
+		m.clearSpawnRequest(name)
+		return false
+	}
+	if _, alive := m.processStatus(name); alive {
+		// Already satisfied by a race (e.g. a crash-restart beat the delegated
+		// request to it): nothing left to spawn.
+		m.clearSpawnRequest(name)
+		return false
+	}
+	pid, err := m.spawnDirect(name, def)
+	m.clearSpawnRequest(name)
+	if err != nil {
+		fmt.Printf("Failed to fulfill delegated spawn request for %s: %v\n", name, err)
+		return false
+	}
+	m.resetRestartAttempt(name)
+	fmt.Printf("Fulfilled delegated spawn request for %s with pid %d\n", name, pid)
+	return true
 }
 
 // superviseRunning maintains a running process: resets backoff once stable and

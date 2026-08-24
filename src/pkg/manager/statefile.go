@@ -34,11 +34,35 @@ type Process struct {
 	// when the start succeeds or fails. Omitted from JSON when unset, so
 	// existing state files load unchanged.
 	StartingSince *float64 `json:"starting_since,omitempty"`
+	// SpawnRequestedAt marks a pending delegated spawn request from an
+	// external CLI invocation (auto start / auto restart / auto start-all /
+	// auto restart-all) that is not itself the watch daemon process. Only the
+	// watch daemon's own fork/exec produces a child owned by the signed
+	// Auto.app identity; a spawn performed directly by an arbitrary CLI
+	// caller instead inherits THAT caller's macOS "responsible process" and
+	// XNU resource coalition (e.g. an agent session, an editor, a terminal),
+	// which corrupts coalition-aggregated readings such as Force Quit
+	// Applications / memory-pressure dialogs. Set by delegateSpawnToDaemon,
+	// cleared by fulfillSpawnRequest once the daemon spawns the process (or
+	// finds it already alive, or discards it as stale). Omitted from JSON
+	// when unset, so existing state files load unchanged.
+	SpawnRequestedAt *float64 `json:"spawn_requested_at,omitempty"`
 }
 
 // stateFile is the top-level shape of state.json.
 type stateFile struct {
 	Processes map[string]*Process `json:"processes"`
+	// DaemonHeartbeat and DaemonPid identify whichever process is currently
+	// running WatchTick against THIS state file, refreshed at the top of
+	// every tick (~1s). StartProcess reads it to decide whether to delegate
+	// a spawn there (see delegateSpawnToDaemon) instead of forking directly.
+	// Deliberately scoped to this state file rather than a system-wide
+	// `launchctl` query: an isolated test Manager's own temp state file is
+	// never ticked by any watch loop, so it can never mistake an unrelated
+	// production daemon elsewhere on the machine for its own. Omitted from
+	// JSON when unset, so existing state files load unchanged.
+	DaemonHeartbeat *float64 `json:"daemon_heartbeat,omitempty"`
+	DaemonPid       *int     `json:"daemon_pid,omitempty"`
 }
 
 // loadStateFresh reads the entire state file from disk, recovering from

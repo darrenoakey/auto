@@ -2,6 +2,7 @@ package manager
 
 import (
 	"fmt"
+	"os"
 	"syscall"
 	"time"
 )
@@ -17,6 +18,19 @@ var afterPortCheckHook func(port int)
 // process still loses the race for its port (something re-grabs it between
 // this check and its own bind), spawnWithRetry forces the port free again and
 // retries within this same call so the caller sees a single converged start.
+//
+// The actual fork/exec is only ever performed by the watch daemon's own
+// process (see spawnDirect / delegateSpawnToDaemon below): a child spawned
+// directly by an arbitrary CLI caller (an agent session, an editor, a
+// terminal) inherits THAT caller's macOS "responsible process" identity and
+// XNU resource coalition instead of Auto.app's signed one, which is invisible
+// to `ps`/`footprint` but corrupts coalition-aggregated system UI such as
+// Force Quit Applications / memory-pressure dialogs (observed: two tiny,
+// healthy ~100MB managed services both reporting several GB, identically,
+// because they and the agent session that had run `auto restart` on them all
+// shared one coalition). If the daemon is running and this call is not it,
+// StartProcess delegates; otherwise (daemon down, or this call IS the
+// daemon) it spawns directly as before.
 func (m *Manager) StartProcess(name string) (int, error) {
 	def, ok := m.definition(name)
 	if !ok {
@@ -33,6 +47,18 @@ func (m *Manager) StartProcess(name string) (int, error) {
 	if afterPortCheckHook != nil && def.Port != nil {
 		afterPortCheckHook(*def.Port)
 	}
+	if daemonPid := m.liveDaemon(); daemonPid != 0 && daemonPid != os.Getpid() {
+		return m.delegateSpawnToDaemon(name)
+	}
+	return m.spawnDirect(name, def)
+}
+
+// spawnDirect performs the actual fork/exec in the calling process. Callers
+// must only use this when the calling process IS the watch daemon (its own
+// spawns are correctly owned by Auto.app) or when no live daemon heartbeat is
+// recorded to delegate to (e.g. before the daemon has ticked for the first
+// time, or in an isolated test Manager whose state file no watch loop ticks).
+func (m *Manager) spawnDirect(name string, def *Process) (int, error) {
 	// Claim the start before spawning: for the whole spawn window the entry
 	// still has Pid=nil, and a concurrent WatchTick reading that would start a
 	// competing copy (observed: `auto add` and the watch loop each spawning one
@@ -48,6 +74,59 @@ func (m *Manager) StartProcess(name string) (int, error) {
 	}
 	m.recordStarted(name, pid, logPath)
 	return pid, nil
+}
+
+// DaemonHeartbeatTTL bounds how stale a recorded daemon heartbeat may be
+// before it is treated as gone. The daemon writes a fresh one at the top of
+// every ~1s WatchTick (see recordHeartbeat in watch.go), so 3x that
+// comfortably tolerates one slow tick without flapping between delegated and
+// direct spawning.
+const DaemonHeartbeatTTL = 3 * time.Second
+
+// liveDaemon returns the pid of the process currently watching THIS state
+// file, or 0 if none has ticked recently. Scoped to this Manager's own state
+// file rather than a system-wide `launchctl` query, so an isolated test
+// Manager — whose temp state file no watch loop ever ticks — never mistakes
+// an unrelated production daemon elsewhere on the machine for its own.
+func (m *Manager) liveDaemon() int {
+	data := m.loadStateFile()
+	if data.DaemonHeartbeat == nil || data.DaemonPid == nil {
+		return 0
+	}
+	if nowUnix()-*data.DaemonHeartbeat > DaemonHeartbeatTTL.Seconds() {
+		return 0
+	}
+	return *data.DaemonPid
+}
+
+// SpawnRequestTTL bounds how long a delegated spawn request waits for the
+// watch daemon to fulfill it before the requester gives up, and how long the
+// daemon itself will still honor a request it did not reach immediately. Sized
+// above the daemon's 1s tick period plus the worst-case spawn budget
+// (SpawnRetryAttempts retries at up to SpawnRetryBaseDelay*attempt apart, plus
+// SpawnVerifyDelay each) so a slow-but-legitimate spawn is never mistaken for
+// an abandoned request.
+const SpawnRequestTTL = 20 * time.Second
+
+// delegateSpawnToDaemon asks the already-running watch daemon to perform the
+// fork/exec for name, then blocks until the daemon reports the process alive
+// or SpawnRequestTTL elapses. See StartProcess for why this indirection
+// exists: only the daemon's own process may fork/exec a managed service.
+func (m *Manager) delegateSpawnToDaemon(name string) (int, error) {
+	m.mutateProcess(name, func(p *Process) {
+		now := nowUnix()
+		p.SpawnRequestedAt = &now
+	})
+	deadline := time.Now().Add(SpawnRequestTTL)
+	for time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+		if pid, alive := m.processStatus(name); alive {
+			return pid, nil
+		}
+	}
+	return 0, fmt.Errorf(
+		"watch daemon did not spawn %s within %s; check `auto log %s` and that `auto watch` is running",
+		name, SpawnRequestTTL, name)
 }
 
 // StartInFlightTTL bounds how long a start claim suppresses supervision. A
@@ -88,6 +167,24 @@ func startClaimIsLive(p *Process) bool {
 		return false
 	}
 	return nowUnix()-*p.StartingSince < StartInFlightTTL.Seconds()
+}
+
+// clearSpawnRequest releases a delegated spawn request, whether fulfilled,
+// found already satisfied by a race, or discovered stale/abandoned.
+func (m *Manager) clearSpawnRequest(name string) {
+	m.mutateProcess(name, func(p *Process) { p.SpawnRequestedAt = nil })
+}
+
+// isSpawnRequestLive reports whether a delegated spawn request is present and
+// still within SpawnRequestTTL. Mirrors startClaimIsLive: an expired request
+// means the requesting CLI invocation gave up (or died) before the daemon
+// reached it, so the daemon must not spawn a delayed, unwanted copy long
+// after the caller stopped waiting.
+func isSpawnRequestLive(p *Process) bool {
+	if p == nil || p.SpawnRequestedAt == nil {
+		return false
+	}
+	return nowUnix()-*p.SpawnRequestedAt < SpawnRequestTTL.Seconds()
 }
 
 // recordStarted writes the runtime fields of a freshly started process,
