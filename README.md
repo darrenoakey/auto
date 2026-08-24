@@ -126,6 +126,97 @@ auto watch
 
 Continuously monitors processes and restarts any that crash. This runs automatically via LaunchAgent after installation.
 
+## Windowed GUI apps showing wildly inflated / identical memory in Force Quit
+
+**Symptom:** Two or more unrelated `auto`-managed GUI apps (e.g. a tiny ~100MB
+dashboard and another tiny app) all show the exact same multi-GB figure in
+**Force Quit Applications** (⌥⌘Esc) and in the "out of application memory"
+critical-pressure dialog, even though each process's own `phys_footprint`
+(`footprint <pid>`, `vmmap -summary`, Activity Monitor's own live reading) is
+small and correct.
+
+**Root cause:** every process `auto watch` forks/execs is a normal child of
+the `auto` daemon, so it inherits the daemon's own XNU *resource coalition*
+(kernel-level grouping used for jetsam/memory-pressure accounting — see
+`powermetrics --show-process-coalition`). If `auto` also manages ANY
+memory-heavy service (an LLM server, a big Electron/Chromium child, etc.),
+that service ends up in the **same coalition** as every other `auto`-managed
+app. macOS's Force Quit / "out of application memory" view attributes the
+whole coalition's aggregate memory to every *visible-window* member of that
+coalition — so a 100MB dashboard shows the multi-GB total of whatever heavy
+sibling shares its coalition, identically to every other windowed sibling.
+This is a real macOS accounting behavior, not a leak in the small apps, and
+`vm_stat`/`footprint`/`vmmap` per-process readings never show it because
+they report true per-process figures, not the coalition aggregate.
+
+**Permanent fix — give the process its own coalition:** only launchd itself
+(via `launchctl bootstrap` of a **separate LaunchAgent**, one per app) can
+create a fresh coalition; a plain `auto`-managed fork/exec can't opt out.
+
+`auto` has a **built-in `--isolate` mode** that does this for you — no
+hand-rolled per-app bundle/plist/launchctl scripting needed:
+
+```bash
+auto stop myapp
+auto update myapp --isolate on
+auto start myapp
+```
+
+`--isolate on` registers a dedicated `com.darrenoakey.<name>` LaunchAgent
+(plist under `~/Library/LaunchAgents`) that execs the process directly via a
+tiny compiled shim (`~/bin/auto-shim`), so `start`/`stop`/`restart`/`ps` keep
+the exact same interface — internally `StartProcess`/`StopProcess`/
+`RestartProcess`/`processStatus` all delegate to `launchctl
+bootstrap`/`kickstart`/`bootout`/`list` instead of forking directly, and
+`auto watch`'s own tick skips isolate-mode processes entirely (launchd fully
+owns their liveness/restart — auto never spawns or restarts them). `auto ps`
+shows the mode in its `MODE` column (`auto` vs `isolate`). Revert with
+`auto stop myapp && auto update myapp --isolate off` — the flag refuses to
+flip while the process is alive under its current mode, so you can't
+silently orphan a running instance. `auto remove` on an isolate-mode process
+boots the launchd job out and deletes its plist, leaving no trace.
+
+Verify with `powermetrics -i 1000 -n 1 --samplers tasks
+--show-process-coalition` — the app must appear as the sole member of its
+own `com.darrenoakey.<name>` coalition, not nested under
+`com.darrenoakey.auto`.
+
+This is exactly the pattern `activity` (`~/src/activity/run` → `cmd_bundle`)
+and `agentd-gauge` (`~/src/agentd-gauge/run` → `cmd_bundle`) already used by
+hand-rolling their own hand-written plist + `launchctl bootstrap` steps
+before `--isolate` existed; both are compiled Go/Gio binaries, which is the
+case this pattern reliably fixes.
+
+**Confirmed limitation — Python / interpreter-embedding apps CANNOT
+currently use `--isolate` on this machine (macOS 26 Tahoe beta), even
+through the compiled shim:** a Python (including PyInstaller-bundled
+Mach-O) process spawned by a **freshly bootstrapped** LaunchAgent hangs
+indefinitely during interpreter initialization (confirmed stuck inside
+`Py_InitializeFromConfig`, 0% CPU, ~16MB RSS, zero file I/O, for 25+
+seconds) regardless of *how* it is invoked — directly, via `open -W -n
+<bundle>`, or via `auto-shim`'s own `syscall.Exec("/bin/sh", "-c", "exec
+...")` (tested 2026-08-25 on `calendar-display`/PySide6: `auto update
+calendar-display --isolate on` reproduced the identical hang; reverted with
+`--isolate off`). The shim does not help because `syscall.Exec` replaces
+the process image in place — the pid launchd is tracking as its direct
+child is still, ultimately, the same Python process either way; only the
+intermediate argv/image differs, not the launchd-spawn characteristic that
+actually triggers the hang. The exact same binary launched by an
+already-running warm process (e.g. `auto` itself, or an interactive shell)
+starts normally in seconds. Also reproduced earlier with `nativ`'s
+`mlx-vlm-server` (PyInstaller). **Do not** retry any variation of routing a
+Python/interpreter-based `auto`-managed app through a dedicated LaunchAgent
+(direct, `open`, or shim) until this is confirmed fixed in a later macOS
+release — leave them under plain `auto` (`--isolate off`, the default) and
+accept they'll share `auto`'s coalition. If a Python app's inflated-memory
+reading actually matters, the only reliable fix today is porting it to a
+compiled language (as `activity`/`agentd-gauge` already are, in Go+Gio) so
+it can use `--isolate`.
+
+`auto log <name> --tail` **follows forever and blocks** — never run it from
+an agent/script without a hard timeout; use plain `auto log <name>` for a
+one-shot dump.
+
 ## Examples
 
 ### Running a Web Server
@@ -164,8 +255,8 @@ auto ps
 | `start <name>` | Start a configured process |
 | `stop <name>` | Stop a running process |
 | `restart <name>` | Stop and start a process |
-| `add <name> <command> [--port PORT]` | Add a new process and start it |
-| `update <name> [--port PORT] [--workdir DIR]` | Update process settings |
+| `add <name> <command> [--port PORT] [--isolate on\|off]` | Add a new process and start it |
+| `update <name> [--port PORT] [--workdir DIR] [--isolate on\|off]` | Update process settings |
 | `remove <name>` | Stop and remove a process |
 | `show <name>` | Display the command for a process |
 | `log <name> [--tail] [--file]` | View process logs |

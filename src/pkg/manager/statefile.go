@@ -47,6 +47,18 @@ type Process struct {
 	// finds it already alive, or discards it as stale). Omitted from JSON
 	// when unset, so existing state files load unchanged.
 	SpawnRequestedAt *float64 `json:"spawn_requested_at,omitempty"`
+	// Isolate marks a process as launchd-managed instead of daemon-managed:
+	// StartProcess/StopProcess/RestartProcess/processStatus all delegate to
+	// isolate.go, which registers a dedicated per-process LaunchAgent
+	// (com.darrenoakey.<name>) instead of forking the child directly. A
+	// direct child of the watch daemon inherits Auto.app's own XNU resource
+	// coalition; if the daemon also supervises anything memory-heavy, every
+	// windowed sibling shows that heavy process's aggregate memory in Force
+	// Quit, identically (see README "Windowed GUI apps..."). A dedicated
+	// LaunchAgent is the only way to get a process its own coalition, since
+	// coalition creation is privilege-gated to launchd. Omitted from JSON
+	// when false, so existing state files load unchanged.
+	Isolate bool `json:"isolate,omitempty"`
 }
 
 // stateFile is the top-level shape of state.json.

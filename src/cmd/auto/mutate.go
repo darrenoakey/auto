@@ -22,6 +22,9 @@ func cmdAdd(m *manager.Manager, p *parsedArgs) int {
 	if err := m.AddProcess(name, command, port, ""); err != nil {
 		return failf("%v", err)
 	}
+	if code := applyIsolate(m, name, p); code != 0 {
+		return code
+	}
 	if code := applyRestartEvery(m, name, p); code != 0 {
 		return code
 	}
@@ -41,6 +44,9 @@ func cmdUpdate(m *manager.Manager, p *parsedArgs) int {
 	}
 	if err := m.UpdateProcess(name, optStr(p, "command"), port, optStr(p, "workdir")); err != nil {
 		return failf("%v", err)
+	}
+	if code := applyIsolate(m, name, p); code != 0 {
+		return code
 	}
 	return reportUpdate(m, name, p)
 }
@@ -81,6 +87,27 @@ func applyRestartEvery(m *manager.Manager, name string, p *parsedArgs) int {
 		return failf("%v", err)
 	}
 	if err := m.SetRestartInterval(name, &secs); err != nil {
+		return failf("%v", err)
+	}
+	return 0
+}
+
+// applyIsolate sets or clears isolate mode from --isolate=on|off if given.
+func applyIsolate(m *manager.Manager, name string, p *parsedArgs) int {
+	v, ok := p.values["isolate"]
+	if !ok {
+		return 0
+	}
+	var isolate bool
+	switch strings.ToLower(v) {
+	case "on", "true", "yes":
+		isolate = true
+	case "off", "false", "no":
+		isolate = false
+	default:
+		return failf("--isolate must be on or off, got %q", v)
+	}
+	if err := m.SetIsolate(name, isolate); err != nil {
 		return failf("%v", err)
 	}
 	return 0

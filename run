@@ -35,7 +35,7 @@ usage() {
     echo "  logs               Tail the live auto daemon log"
     echo ""
     echo "Anything else is passed straight to the signed binary, e.g.:"
-    echo "  ps  start <name>  stop <name>  restart <name>  add ...  stop-all  ..."
+    echo "  ps  start <name>  stop <name>  restart <name>  add ... [--isolate on|off]  stop-all  ..."
     exit 1
 }
 
@@ -134,6 +134,20 @@ cmd_install() {
     cmd_build
     echo "==> Installing signed daemon..."
     "$APP_EXE" -q install
+    install_shim
+}
+
+# install_shim copies the built auto-shim binary to ~/bin, where isolate.go's
+# shimPath() expects to find it. Isolate-mode LaunchAgents exec this directly
+# (not through the bundled Auto.app), so it needs no code signing of its own —
+# it just replaces the interpreter-hang-prone Python-init cold-launch path
+# with a plain exec() into the real command.
+install_shim() {
+    local dest="$HOME/bin/auto-shim"
+    mkdir -p "$HOME/bin"
+    cp "$BIN_DIR/auto-shim" "$dest"
+    chmod +x "$dest"
+    echo "==> Installed auto-shim -> $dest"
 }
 
 watcher_pid() {
@@ -185,6 +199,7 @@ cmd_deploy() {
         return 1
     }
     cmd_build
+    install_shim
     old_pid="$(watcher_pid)" || {
         echo "FAIL: cannot safely replace a watcher that launchd is not running" >&2
         return 1

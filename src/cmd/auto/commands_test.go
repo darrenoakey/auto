@@ -41,6 +41,15 @@ func TestRestartColumn(t *testing.T) {
 	}
 }
 
+func TestModeColumn(t *testing.T) {
+	if got := modeColumn(manager.ProcessInfo{Isolate: true}); got != "isolate" {
+		t.Fatalf("isolate mode column = %q, want isolate", got)
+	}
+	if got := modeColumn(manager.ProcessInfo{}); got != "auto" {
+		t.Fatalf("default mode column = %q, want auto", got)
+	}
+}
+
 func TestCmdStopAllNoRunning(t *testing.T) {
 	m := manager.New(t.TempDir())
 	if code := cmdStopAll(m); code != 0 {

@@ -24,9 +24,9 @@ func cmdPs(m *manager.Manager) int {
 			nameWidth = len(info.Name)
 		}
 	}
-	fmt.Printf("%-*s  %6s  %5s  %9s\n", nameWidth, "NAME", "PID", "PORT", "RESTART")
+	fmt.Printf("%-*s  %6s  %5s  %9s  %7s\n", nameWidth, "NAME", "PID", "PORT", "RESTART", "MODE")
 	for _, info := range infos {
-		fmt.Printf("%-*s  %6s  %5s  %9s\n", nameWidth, info.Name, pidColumn(info), portColumn(info), restartColumn(info))
+		fmt.Printf("%-*s  %6s  %5s  %9s  %7s\n", nameWidth, info.Name, pidColumn(info), portColumn(info), restartColumn(info), modeColumn(info))
 	}
 	return 0
 }
@@ -57,6 +57,15 @@ func restartColumn(info manager.ProcessInfo) string {
 		return "-"
 	}
 	return manager.FormatInterval(*info.RestartInterval)
+}
+
+// modeColumn renders the MODE column: whether the process is launchd-managed
+// (isolate, its own XNU resource coalition) or daemon-managed (auto).
+func modeColumn(info manager.ProcessInfo) string {
+	if info.Isolate {
+		return "isolate"
+	}
+	return "auto"
 }
 
 // cmdStart starts a configured process.

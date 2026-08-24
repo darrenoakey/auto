@@ -24,6 +24,9 @@ func (m *Manager) WatchTick() {
 	defer m.setProcSnapshot(nil)
 	restarts := 0
 	for _, name := range m.definedNames() {
+		if def, ok := m.definition(name); ok && def.Isolate {
+			continue
+		}
 		if restarts < MaxRestartsPerWatchTick && m.fulfillSpawnRequest(name) {
 			restarts++
 			continue

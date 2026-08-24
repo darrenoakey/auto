@@ -27,6 +27,16 @@ func TestParseArgsBoolFlags(t *testing.T) {
 	}
 }
 
+func TestParseArgsRecognizesIsolateForAddAndUpdate(t *testing.T) {
+	p, err := parseArgs([]string{"svc", "sleep", "300", "--isolate", "on"}, valueSet("port", "restart-every", "isolate"), nil)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if p.values["isolate"] != "on" {
+		t.Fatalf("--isolate should be recognized as a value flag, got %q", p.values["isolate"])
+	}
+}
+
 func TestParseArgsMissingValueErrors(t *testing.T) {
 	if _, err := parseArgs([]string{"--port"}, valueSet("port"), nil); err == nil {
 		t.Fatal("missing flag value should error")

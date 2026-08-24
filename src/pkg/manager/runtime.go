@@ -4,10 +4,19 @@ import "time"
 
 // processStatus returns the live pid of a managed process, or (0, false) if it
 // is not running. PID-reuse is defeated by matching the recorded start time.
+// Isolate-mode processes are launchd-managed: liveness is queried directly
+// from launchd rather than from auto's own recorded pid/start-time, since
+// auto never spawns or records them.
 func (m *Manager) processStatus(name string) (int, bool) {
 	data := m.loadStateFile()
 	p, ok := data.Processes[name]
-	if !ok || p.Pid == nil {
+	if !ok {
+		return 0, false
+	}
+	if p.Isolate {
+		return isolateStatus(name)
+	}
+	if p.Pid == nil {
 		return 0, false
 	}
 	if isOurProcessVia(m.snapshotProcs(), *p.Pid, p.StartTime) {

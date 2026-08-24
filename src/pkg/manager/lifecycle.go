@@ -36,6 +36,9 @@ func (m *Manager) StartProcess(name string) (int, error) {
 	if !ok {
 		return 0, fmt.Errorf("process %s not found in config", name)
 	}
+	if def.Isolate {
+		return m.isolateStart(name, def.Command, def.Workdir)
+	}
 	if pid, alive := m.processStatus(name); alive {
 		return 0, fmt.Errorf("process %s is already running with pid %d", name, pid)
 	}
@@ -238,8 +241,18 @@ func waitForProcessDeath(pid int, timeout time.Duration) bool {
 // stopped" and race a competing respawn into the gap while this call is still
 // tearing the old instance down.
 func (m *Manager) StopProcess(name string, markExplicit bool) error {
-	if _, ok := m.definition(name); !ok {
+	def, ok := m.definition(name)
+	if !ok {
 		return fmt.Errorf("process %s not found in config", name)
+	}
+	if def.Isolate {
+		if err := m.isolateStop(name); err != nil {
+			return err
+		}
+		if markExplicit {
+			m.markExplicitlyStopped(name)
+		}
+		return nil
 	}
 	pid, alive := m.processStatus(name)
 	if !alive {
@@ -370,6 +383,14 @@ func (m *Manager) RestartProcess(name string) (int, error) {
 	def, ok := m.definition(name)
 	if !ok {
 		return 0, fmt.Errorf("process %s not found in config", name)
+	}
+	if def.Isolate {
+		pid, err := m.isolateRestart(name, def.Command, def.Workdir)
+		if err != nil {
+			return 0, err
+		}
+		m.clearExplicitStop(name)
+		return pid, nil
 	}
 	if pid, alive := m.processStatus(name); alive {
 		if err := m.obliterateProcess(name, pid, true); err != nil {

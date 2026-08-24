@@ -18,6 +18,7 @@ type ProcessInfo struct {
 	Workdir           string
 	ExplicitlyStopped bool
 	RestartInterval   *int
+	Isolate           bool
 }
 
 // AddProcess registers a new process definition. The workdir defaults to the
@@ -85,10 +86,15 @@ func (m *Manager) UpdateProcess(name string, command *string, port *int, workdir
 
 // RemoveProcess stops a process if running and deletes it from the state file.
 func (m *Manager) RemoveProcess(name string) error {
-	if _, ok := m.definition(name); !ok {
+	def, ok := m.definition(name)
+	if !ok {
 		return fmt.Errorf("process %s not found in config", name)
 	}
-	if _, alive := m.processStatus(name); alive {
+	if def.Isolate {
+		if err := m.isolateRemoveArtifacts(name); err != nil {
+			return err
+		}
+	} else if _, alive := m.processStatus(name); alive {
 		if err := m.StopProcess(name, true); err != nil {
 			return err
 		}
@@ -134,6 +140,7 @@ func (m *Manager) ListProcesses() []ProcessInfo {
 			Workdir:           p.Workdir,
 			ExplicitlyStopped: p.ExplicitlyStopped,
 			RestartInterval:   p.RestartIntervalSeconds,
+			Isolate:           p.Isolate,
 		})
 	}
 	return infos
