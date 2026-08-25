@@ -87,6 +87,32 @@ func TestUpdateProcessChangesFields(t *testing.T) {
 	}
 }
 
+// TestUpdateProcessEmptyWorkdirClears pins the clear semantic: an explicit
+// empty workdir stores empty rather than resolving "" — which filepath.Abs
+// turns into the updater's own cwd — back into the definition.
+func TestUpdateProcessEmptyWorkdirClears(t *testing.T) {
+	m := newTestManager(t)
+	dir := t.TempDir()
+	if err := m.AddProcess("svc", "sleep 1", nil, dir); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	restore, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(restore) })
+	empty := ""
+	if err := m.UpdateProcess("svc", nil, nil, &empty); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	def, _ := m.definition("svc")
+	if def.Workdir != "" {
+		t.Fatalf("workdir = %q, want cleared to empty", def.Workdir)
+	}
+}
 func TestUpdateProcessMissingFails(t *testing.T) {
 	m := newTestManager(t)
 	if err := m.UpdateProcess("ghost", nil, nil, nil); err == nil {

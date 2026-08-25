@@ -53,13 +53,16 @@ func (m *Manager) AddProcess(name, command string, port *int, workdir string) er
 }
 
 // UpdateProcess updates the command, port, or workdir of an existing process.
-// Nil arguments leave the corresponding field unchanged.
+// Nil arguments leave the corresponding field unchanged. A non-nil empty
+// workdir clears the field (the service runs from the filesystem root);
+// filepath.Abs("") would otherwise resolve to the updater's own cwd — the
+// same silent capture add used to have.
 func (m *Manager) UpdateProcess(name string, command *string, port *int, workdir *string) error {
 	if err := validatePort(port); err != nil {
 		return err
 	}
 	resolvedWd := ""
-	if workdir != nil {
+	if workdir != nil && *workdir != "" {
 		wd, err := resolveExistingDir(*workdir)
 		if err != nil {
 			return err
