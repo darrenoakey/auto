@@ -53,6 +53,14 @@ auto add myapi "python3 /path/to/api.py" --port 8080
 
 Adds a process with port information for reference.
 
+```bash
+auto add myapp "./run serve" --workdir /path/to/repo
+```
+
+Adds a process with an explicit working directory. Without `--workdir` the
+service runs from `/` — never the directory you ran `auto add` from — so a
+service's cwd is always a configured, visible property (`auto show` prints it).
+
 ### Start, Stop, and Restart
 
 ```bash
@@ -236,7 +244,7 @@ auto add data-sync "/path/to/sync_data.sh"
 ### Managing Multiple Services
 
 ```bash
-auto add api-server "python3 api/server.py" --port 8000
+auto add api-server "python3 api/server.py" --port 8000 --workdir /path/to/repo
 auto add web-ui "npm start --prefix /path/to/frontend" --port 3000
 auto add redis "redis-server /etc/redis.conf"
 
@@ -255,10 +263,10 @@ auto ps
 | `start <name>` | Start a configured process |
 | `stop <name>` | Stop a running process |
 | `restart <name>` | Stop and start a process |
-| `add <name> <command> [--port PORT] [--isolate on\|off]` | Add a new process and start it |
+| `add <name> <command> [--port PORT] [--workdir DIR] [--isolate on\|off]` | Add a new process and start it |
 | `update <name> [--port PORT] [--workdir DIR] [--isolate on\|off]` | Update process settings |
 | `remove <name>` | Stop and remove a process |
-| `show <name>` | Display the command for a process |
+| `show <name>` | Display the command and workdir for a process |
 | `log <name> [--tail] [--file]` | View process logs |
 | `start-all` | Start all configured processes |
 | `stop-all` | Stop all running processes (watch daemon respawns them) |

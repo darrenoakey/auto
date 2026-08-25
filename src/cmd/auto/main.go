@@ -36,7 +36,7 @@ func dispatch(m *manager.Manager, command string, args []string) int {
 	case "start", "stop", "restart", "remove", "show", "status":
 		return dispatchNamed(m, command, args)
 	case "add":
-		return withArgs(args, valueSet("port", "restart-every", "isolate"), nil, func(p *parsedArgs) int { return cmdAdd(m, p) })
+		return withArgs(args, valueSet("port", "workdir", "restart-every", "isolate"), nil, func(p *parsedArgs) int { return cmdAdd(m, p) })
 	case "update":
 		return withArgs(args, valueSet("command", "port", "workdir", "restart-every", "isolate"), nil, func(p *parsedArgs) int { return cmdUpdate(m, p) })
 	case "log":

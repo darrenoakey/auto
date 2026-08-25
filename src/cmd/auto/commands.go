@@ -106,13 +106,19 @@ func cmdRemove(m *manager.Manager, name string) int {
 	return 0
 }
 
-// cmdShow displays a process command and any periodic restart interval.
+// cmdShow displays a process command, its workdir, and any periodic restart
+// interval.
 func cmdShow(m *manager.Manager, name string) int {
 	command, err := m.GetCommand(name)
 	if err != nil {
 		return failf("%v", err)
 	}
+	workdir, werr := m.GetWorkdir(name)
+	if werr != nil {
+		return failf("%v", werr)
+	}
 	fmt.Printf("%s: %s\n", name, command)
+	fmt.Printf("  workdir: %s\n", effectiveWorkdir(workdir))
 	if iv := m.GetRestartInterval(name); iv != nil {
 		fmt.Printf("  restart every: %s\n", manager.FormatInterval(*iv))
 	}

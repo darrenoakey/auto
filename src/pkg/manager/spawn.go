@@ -77,8 +77,13 @@ func (m *Manager) spawnOnce(name, wrapped, workdir string) (int, string, int64, 
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	// An unset workdir is pinned to the filesystem root rather than inherited
+	// from whichever process invoked auto: inherited cwd once mislabeled
+	// services in monitors that attribute processes by working directory.
 	if workdir != "" {
 		cmd.Dir = workdir
+	} else {
+		cmd.Dir = "/"
 	}
 	if err := cmd.Start(); err != nil {
 		return 0, "", 0, err

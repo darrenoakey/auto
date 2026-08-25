@@ -21,15 +21,21 @@ type ProcessInfo struct {
 	Isolate           bool
 }
 
-// AddProcess registers a new process definition. The workdir defaults to the
-// current directory; a supplied workdir must exist.
+// AddProcess registers a new process definition. A supplied workdir must
+// exist and is stored absolute; an unset workdir is stored empty, meaning the
+// service runs from the filesystem root at spawn time — never the working
+// directory of whatever process invoked auto, which once silently mislabeled
+// services in monitors that attribute processes by cwd.
 func (m *Manager) AddProcess(name, command string, port *int, workdir string) error {
 	if err := validatePort(port); err != nil {
 		return err
 	}
-	resolved, err := resolveWorkdir(workdir)
-	if err != nil {
-		return err
+	if workdir != "" {
+		resolved, err := resolveExistingDir(workdir)
+		if err != nil {
+			return err
+		}
+		workdir = resolved
 	}
 	duplicate := false
 	m.withState(func(data *stateFile) bool {
@@ -37,7 +43,7 @@ func (m *Manager) AddProcess(name, command string, port *int, workdir string) er
 			duplicate = true
 			return false
 		}
-		data.Processes[name] = &Process{Command: command, Port: port, Workdir: resolved}
+		data.Processes[name] = &Process{Command: command, Port: port, Workdir: workdir}
 		return true
 	})
 	if duplicate {
@@ -155,6 +161,16 @@ func (m *Manager) GetCommand(name string) (string, error) {
 	return def.Command, nil
 }
 
+// GetWorkdir returns the configured working directory of a process, or an
+// empty string when unset (the service runs from the filesystem root).
+func (m *Manager) GetWorkdir(name string) (string, error) {
+	def, ok := m.definition(name)
+	if !ok {
+		return "", fmt.Errorf("process %s not found in config", name)
+	}
+	return def.Workdir, nil
+}
+
 // LatestLogPath returns the most recent log file for a process, or "" if none.
 func (m *Manager) LatestLogPath(name string) string {
 	return m.latestLogPath(name)
@@ -169,15 +185,6 @@ func validatePort(port *int) error {
 		return fmt.Errorf("port must be between 1 and 65535")
 	}
 	return nil
-}
-
-// resolveWorkdir defaults an empty workdir to the current directory and
-// validates a supplied one.
-func resolveWorkdir(workdir string) (string, error) {
-	if workdir == "" {
-		return os.Getwd()
-	}
-	return resolveExistingDir(workdir)
 }
 
 // resolveExistingDir expands, absolutises, and verifies a directory path.

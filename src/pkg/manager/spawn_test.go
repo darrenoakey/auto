@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -33,6 +34,67 @@ func TestSpawnWithRetryFastExitHandedBack(t *testing.T) {
 	}
 	if isProcessAlive(pid) {
 		t.Fatalf("pid %d should have exited", pid)
+	}
+}
+
+// TestSpawnUnsetWorkdirPinsRoot pins the determinism fix: a service with no
+// workdir runs from the filesystem root regardless of the invoking process's
+// cwd, so cwd-based attribution can never mislabel it.
+func TestSpawnUnsetWorkdirPinsRoot(t *testing.T) {
+	restore, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(restore) })
+	m := newTestManager(t)
+	logPath := spawnPwd(t, m, "svc-pwd-root", "")
+	if got := strings.TrimSpace(readSpawnLog(t, logPath)); got != "/" {
+		t.Fatalf("pwd = %q, want /", got)
+	}
+}
+
+// TestSpawnExplicitWorkdirRunsThere confirms a stored workdir is honoured at
+// spawn time, so the service's cwd is always the configured directory.
+func TestSpawnExplicitWorkdirRunsThere(t *testing.T) {
+	m := newTestManager(t)
+	dir := t.TempDir()
+	logPath := spawnPwd(t, m, "svc-pwd-dir", dir)
+	if got := strings.TrimSpace(readSpawnLog(t, logPath)); got != dir {
+		t.Fatalf("pwd = %q, want %q", got, dir)
+	}
+}
+
+// spawnPwd runs `pwd` under the manager with the given workdir and returns
+// the per-service log path the child wrote to.
+func spawnPwd(t *testing.T, m *Manager, name, workdir string) string {
+	t.Helper()
+	_, logPath, err := m.spawnWithRetry(name, "pwd", workdir, nil)
+	if err != nil {
+		t.Fatalf("spawn %s: %v", name, err)
+	}
+	return logPath
+}
+
+// readSpawnLog waits briefly for the child's output to reach the log file,
+// then returns its contents from the spawn offset onward.
+func readSpawnLog(t *testing.T, path string) string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		data, err := os.ReadFile(path)
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatalf("read log: %v", err)
+		}
+		if strings.TrimSpace(string(data)) != "" {
+			return string(data)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("log %s stayed empty", path)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

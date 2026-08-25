@@ -19,17 +19,59 @@ func cmdAdd(m *manager.Manager, p *parsedArgs) int {
 	if err != nil {
 		return failf("%v", err)
 	}
-	if err := m.AddProcess(name, command, port, ""); err != nil {
+	workdir := workdirArg(p)
+	if err := m.AddProcess(name, command, port, workdir); err != nil {
 		return failf("%v", err)
 	}
+	warnRelativeCommand(command, workdir)
 	if code := applyIsolate(m, name, p); code != 0 {
 		return code
 	}
 	if code := applyRestartEvery(m, name, p); code != 0 {
 		return code
 	}
-	fmt.Printf("Added %s\n", name)
+	fmt.Printf("Added %s (workdir: %s)\n", name, effectiveWorkdir(workdir))
 	return cmdStart(m, name)
+}
+
+// workdirArg returns the workdir= value flag, or "" when absent.
+func workdirArg(p *parsedArgs) string {
+	if v := optStr(p, "workdir"); v != nil {
+		return *v
+	}
+	return ""
+}
+
+// effectiveWorkdir renders a stored workdir for add output: unset means the
+// service runs from the filesystem root.
+func effectiveWorkdir(workdir string) string {
+	if workdir == "" {
+		return "/"
+	}
+	return workdir
+}
+
+// warnRelativeCommand warns when a command that depends on its working
+// directory was added without one: it will run from / and fail loudly.
+func warnRelativeCommand(command, workdir string) {
+	if !commandNeedsWorkdir(command, workdir) {
+		return
+	}
+	fields := strings.Fields(command)
+	fmt.Printf("warning: %q is relative but no workdir is set; it will run from / — pass workdir=<dir>\n", fields[0])
+}
+
+// commandNeedsWorkdir reports whether the command starts with a relative
+// path while no workdir is set, so it cannot resolve from the spawn root.
+func commandNeedsWorkdir(command, workdir string) bool {
+	if workdir != "" {
+		return false
+	}
+	fields := strings.Fields(command)
+	if len(fields) == 0 {
+		return false
+	}
+	return strings.HasPrefix(fields[0], "./") || strings.HasPrefix(fields[0], "../")
 }
 
 // cmdUpdate updates settings for an existing process.
