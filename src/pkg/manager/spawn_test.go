@@ -1,7 +1,6 @@
 package manager
 
 import (
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -197,78 +196,93 @@ func TestLogHasAddressInUseRespectsOffset(t *testing.T) {
 	}
 }
 
-// TestRestartProcessConvergesThroughPortInterloper reproduces the deploy race
-// end-to-end: something briefly re-grabs a service's port in the exact gap
-// between StartProcess confirming the port free and the new process's own
-// bind() call. Without the fix, the new process's bind fails, it exits, and
-// the caller's crash-restart backoff would be needed to eventually recover
-// (a client-visible connection-refused window). With the fix, spawnWithRetry
-// recognizes the address-in-use marker, forces the interloper off the port,
-// and retries within this single RestartProcess call.
-func TestRestartProcessConvergesThroughPortInterloper(t *testing.T) {
+// TestRestartProcessRefusesPortInterloper pins the refusal side of the port
+// policy end to end: when an unmanaged process steals the service's port in
+// the TOCTOU gap between the free-port check and the child's own bind, the
+// restart must fail cleanly naming the policy, the interloper must survive
+// untouched and keep holding the port, the owned previous instance must still
+// have been stopped, and a later restart must converge once the port is
+// genuinely free — all without ever signalling the interloper.
+func TestRestartProcessRefusesPortInterloper(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
-		t.Skip("python3 unavailable")
+		t.Fatalf("python3 is required for the real listener test: %v", err)
 	}
 	m := newTestManager(t)
 	port := freeEphemeralPort(t)
-	bindCmd := fmt.Sprintf(
-		`python3 -c "import socket,time; s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.bind(('127.0.0.1', %d)); s.listen(1); time.sleep(300)"`,
-		port)
+	bindCmd := listenerCommand(port, false)
 	mustAdd(t, m, "svc", bindCmd, &port)
 	first, err := m.StartProcess("svc")
 	if err != nil {
 		t.Fatalf("initial start: %v", err)
 	}
 	if !waitForPortHeld(port, 3*time.Second) {
-		t.Skip("python3 did not bind the port (environment differs)")
+		t.Fatal("managed listener did not bind its configured port")
 	}
 
-	interloperCmd := fmt.Sprintf(
-		`exec python3 -c "import socket,time; s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); `+
-			`s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('127.0.0.1', %d)); s.listen(1); time.sleep(30)"`,
-		port)
+	interloperCmd := listenerCommand(port, false)
+	interloperPid := 0
 	afterPortCheckHook = func(hookPort int) {
 		if hookPort != port {
 			return
 		}
-		cmd := exec.Command("/bin/sh", "-c", interloperCmd)
+		cmd := exec.Command("/bin/bash", "-c", interloperCmd)
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 		if err := cmd.Start(); err != nil {
 			t.Errorf("failed to start interloper: %v", err)
 			return
 		}
+		interloperPid = cmd.Process.Pid
 		go func() { _, _ = cmd.Process.Wait() }()
 		// Block until the interloper has actually grabbed the port, so the real
 		// spawn is guaranteed to lose the bind race deterministically.
-		waitForPortHeld(port, 2*time.Second)
+		if !waitForPortHeld(port, 2*time.Second) {
+			t.Errorf("interloper did not bind port %d", port)
+		}
 	}
 	t.Cleanup(func() { afterPortCheckHook = nil })
 
-	start := time.Now()
-	second, err := m.RestartProcess("svc")
-	elapsed := time.Since(start)
-	t.Cleanup(func() { _ = m.StopProcess("svc", true) })
-	if err != nil {
-		t.Fatalf("restart should converge despite the port interloper, got error: %v", err)
+	if _, err := m.RestartProcess("svc"); err == nil {
+		t.Fatal("restart must refuse while an unmanaged interloper holds the port")
+	} else if !strings.Contains(err.Error(), "never kills unmanaged port holders") {
+		t.Fatalf("refusal should name the policy, got: %v", err)
 	}
+	if interloperPid == 0 {
+		t.Fatal("interloper must have started inside the TOCTOU hook")
+	}
+	if !isProcessAlive(interloperPid) {
+		t.Fatalf("unmanaged interloper %d must remain alive after the refused restart", interloperPid)
+	}
+	if !waitForPortHeld(port, time.Second) {
+		t.Fatal("interloper must still hold the port after the refused restart")
+	}
+	if isProcessAlive(first) {
+		t.Fatalf("owned previous instance %d must still have been stopped", first)
+	}
+
+	// Only the test ends its own interloper; auto never touched it.
+	if err := syscall.Kill(-interloperPid, syscall.SIGKILL); err != nil {
+		t.Fatalf("killing test interloper: %v", err)
+	}
+	if !waitForPortFree(port, 5*time.Second) {
+		t.Fatal("port should free once the interloper is gone")
+	}
+	afterPortCheckHook = nil
+	second, err := m.RestartProcess("svc")
+	if err != nil {
+		t.Fatalf("restart should converge once the port is genuinely free: %v", err)
+	}
+	t.Cleanup(func() { _ = m.StopProcess("svc", true) })
 	if second == first {
 		t.Fatalf("restart should yield a new pid, both %d", first)
-	}
-	// The interloper sleeps for 30s; converging well inside that window proves
-	// forceFreePort actively reclaimed the port rather than the test merely
-	// waiting out the interloper's own exit.
-	if elapsed > 10*time.Second {
-		t.Fatalf("restart took %s to converge, want well under the interloper's 30s hold", elapsed)
-	}
-	if !isProcessAlive(second) {
-		t.Fatalf("new pid %d should be alive", second)
 	}
 	if !waitForPortHeld(port, 3*time.Second) {
 		t.Fatal("port should be held by the restarted service")
 	}
-	holders := lsofPortPids(port)
-	if len(holders) != 1 || holders[0] != second {
-		t.Fatalf("expected exactly pid %d holding port %d, got %v", second, port, holders)
+	if !endpointResponds(port) {
+		t.Fatal("restarted service should answer connections on its port")
+	}
+	if pid, alive := m.Status("svc"); !alive || pid != second {
+		t.Fatalf("state should track the restarted service, got (%d,%v)", pid, alive)
 	}
 }
 

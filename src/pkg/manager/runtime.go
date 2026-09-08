@@ -19,7 +19,7 @@ func (m *Manager) processStatus(name string) (int, bool) {
 	if p.Pid == nil {
 		return 0, false
 	}
-	if isOurProcessVia(m.snapshotProcs(), *p.Pid, p.StartTime) {
+	if isOurProcess(*p.Pid, p.StartTime) {
 		return *p.Pid, true
 	}
 	return 0, false

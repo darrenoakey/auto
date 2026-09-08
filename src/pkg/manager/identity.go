@@ -2,16 +2,17 @@ package manager
 
 import (
 	"errors"
-	"os/exec"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
-// lstartLayouts are the locale-dependent formats emitted by `ps -o lstart=`.
-// US locale yields "Mon Jan 26 10:35:12 2026"; en_AU yields
-// "Mon 26 Jan 10:57:01 2026". Both space-padded and unpadded days are accepted.
+// lstartLayouts are the locale-dependent formats historically emitted by
+// `ps -o lstart=`. US locale yields "Mon Jan 26 10:35:12 2026"; en_AU yields
+// "Mon 26 Jan 10:57:01 2026". Both space-padded and unpadded days are
+// accepted. They are still parsed because state files written by earlier
+// releases record start times in exactly these forms.
 var lstartLayouts = []string{
 	"Mon Jan _2 15:04:05 2006",
 	"Mon Jan 2 15:04:05 2006",
@@ -19,36 +20,62 @@ var lstartLayouts = []string{
 	"Mon 2 Jan 15:04:05 2006",
 }
 
-// isProcessAlive reports whether a process with the given pid is running and is
-// not a zombie. macOS has no /proc, so liveness is confirmed with signal 0 and
-// the zombie check is done via ps.
-func isProcessAlive(pid int) bool {
+// psLstartLayout is the format new start-time identity strings are rendered
+// in: the US ps form, which parseLstartTime accepts. Rendering the kernel's
+// start timeval into the same family of strings keeps stored identity
+// comparable across releases without a format migration.
+const psLstartLayout = "Mon Jan _2 15:04:05 2006"
+
+// procStateZombie is Darwin's SZOMB from sys/proc.h: the process exited but
+// has not been reaped. A zombie owns no live execution, so supervision must
+// treat it as dead. P_stat 0 is likewise never a live process.
+const procStateZombie = 5
+
+// kernelProc answers one targeted kernel query for a single pid via the
+// kern.proc.pid sysctl. It never enumerates the process table and never
+// forks a helper process: the syscall returns exactly one kinfo_proc or an
+// error for a pid that no longer exists.
+func kernelProc(pid int) (*unix.KinfoProc, error) {
 	if pid <= 0 {
-		return false
+		return nil, syscall.ESRCH
 	}
+	return unix.SysctlKinfoProc("kern.proc.pid", pid)
+}
+
+// isProcessAlive reports whether a process with the given pid is running and
+// is not a zombie. Existence is confirmed with signal 0 (EPERM means another
+// user's live process), and the zombie check reads the kernel's scheduler
+// state from the same per-pid sysctl that supplies the start time.
+func isProcessAlive(pid int) bool {
 	err := syscall.Kill(pid, 0)
 	if err != nil && !errors.Is(err, syscall.EPERM) {
 		return false
 	}
-	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "state=").Output()
+	info, err := kernelProc(pid)
 	if err != nil {
 		return false
 	}
-	state := strings.TrimSpace(string(out))
-	if state == "" {
-		return false
-	}
-	return state != "Z" && state != "Z+"
+	state := info.Proc.P_stat
+	return state != 0 && state != procStateZombie
 }
 
-// processStartTime returns the start-time string for a pid (as ps reports it),
-// or "" if the process is gone.
+// processStartTime returns the pid's start time rendered as a ps-compatible
+// lstart string, or "" if the process is gone. The instant comes from the
+// kernel's kern.proc.pid sysctl.
 func processStartTime(pid int) string {
-	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=").Output()
+	info, err := kernelProc(pid)
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(out))
+	return renderLstartTime(info.Proc.P_starttime)
+}
+
+// renderLstartTime renders a kernel start timeval as the ps-compatible local
+// wall-clock string used for stored process identity, so strings written by
+// this code and strings written by earlier ps-based releases parse and
+// compare identically.
+func renderLstartTime(tv unix.Timeval) string {
+	return time.Unix(tv.Sec, int64(tv.Usec)*int64(time.Microsecond)).Format(psLstartLayout)
 }
 
 // parseLstartTime parses a ps lstart string, tolerating locale differences.
@@ -64,35 +91,12 @@ func parseLstartTime(s string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// isOurProcess reports whether pid is alive AND matches the recorded start time.
-// This defeats PID reuse after a reboot. A missing recorded start time is
-// treated as stale (returns false) so the process is restarted with proper
-// tracking, exactly as the Python implementation did.
+// isOurProcess reports whether pid is alive AND matches the recorded start
+// time. This defeats PID reuse after a reboot: a recycled pid carries a
+// different kernel start time than the one retained at spawn. A missing
+// recorded start time is treated as stale (returns false) so the process is
+// restarted with proper tracking, exactly as the Python implementation did.
 func isOurProcess(pid int, expectedStartTime *string) bool {
-	return isOurProcessVia(nil, pid, expectedStartTime)
-}
-
-// isOurProcessVia is isOurProcess against an optional process-table snapshot.
-// The watch loop supplies a snapshot so a tick costs one `ps` rather than two
-// per managed service (see procTable).
-//
-// A snapshot can only ever SHORT-CIRCUIT A POSITIVE. A negative always falls
-// through to the authoritative per-pid `ps`, because the snapshot may predate a
-// spawn it cannot see: `auto start` from the CLI is a separate process that
-// writes the new pid into the state file the daemon then reads, so that pid is
-// legitimately absent from a snapshot taken microseconds earlier. Trusting that
-// absence made the daemon declare a just-started service dead and start it
-// again, orphaning the first copy (observed: canary-probe 83444 orphaned by a
-// restart to 83447). Negatives are rare — a service that genuinely looks dead
-// is about to be forked anyway — so this keeps the steady-state fork count at
-// zero while making a spurious double-spawn impossible.
-//
-// The residual imprecision is unchanged from the pre-snapshot code: a process
-// that dies mid-tick is noticed on the next tick rather than this one.
-func isOurProcessVia(table *procTable, pid int, expectedStartTime *string) bool {
-	if table != nil && snapshotIsOurProcess(table, pid, expectedStartTime) {
-		return true
-	}
 	if !isProcessAlive(pid) {
 		return false
 	}
@@ -106,27 +110,7 @@ func isOurProcessVia(table *procTable, pid int, expectedStartTime *string) bool 
 	return startTimesMatch(actual, *expectedStartTime)
 }
 
-// snapshotIsOurProcess answers isOurProcess from a process-table snapshot,
-// applying the same alive / not-zombie / start-time-matches rules as the
-// per-pid `ps` path. A pid absent from a valid snapshot is genuinely gone.
-func snapshotIsOurProcess(table *procTable, pid int, expectedStartTime *string) bool {
-	if pid <= 0 || expectedStartTime == nil {
-		return false
-	}
-	entry, present := table.lookup(pid)
-	if !present {
-		return false
-	}
-	if entry.state == "" || entry.state == "Z" || entry.state == "Z+" {
-		return false
-	}
-	if entry.lstart == "" {
-		return false
-	}
-	return startTimesMatch(entry.lstart, *expectedStartTime)
-}
-
-// startTimesMatch compares two `ps` lstart strings, parsing both when possible
+// startTimesMatch compares two ps lstart strings, parsing both when possible
 // so locale differences in layout do not cause a false mismatch, and falling
 // back to an exact string compare when either side is unparseable.
 func startTimesMatch(actual, expected string) bool {

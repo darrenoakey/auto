@@ -13,11 +13,13 @@ import (
 // check and the child's own bind() call; production code never sets it.
 var afterPortCheckHook func(port int)
 
-// StartProcess launches a configured process, force-freeing its port first, and
+// StartProcess launches a configured process, refusing first if its port is
+// occupied by another process (auto never kills unmanaged port holders), and
 // records its pid and start time for identity verification. If the new
 // process still loses the race for its port (something re-grabs it between
-// this check and its own bind), spawnWithRetry forces the port free again and
-// retries within this same call so the caller sees a single converged start.
+// this check and its own bind), spawnWithRetry detects the bind failure and
+// refuses within this same call, naming the port holder policy, rather than
+// killing the interloper.
 //
 // The actual fork/exec is only ever performed by the watch daemon's own
 // process (see spawnDirect / delegateSpawnToDaemon below): a child spawned
@@ -42,10 +44,8 @@ func (m *Manager) StartProcess(name string) (int, error) {
 	if pid, alive := m.processStatus(name); alive {
 		return 0, fmt.Errorf("process %s is already running with pid %d", name, pid)
 	}
-	if def.Port != nil && !isPortFree(*def.Port) && !forceFreePort(*def.Port) {
-		return 0, fmt.Errorf(
-			"cannot start %s: port %d still in use after killing all holders. Check with: lsof -i :%d",
-			name, *def.Port, *def.Port)
+	if err := ensurePortFree(def.Port, name); err != nil {
+		return 0, err
 	}
 	if afterPortCheckHook != nil && def.Port != nil {
 		afterPortCheckHook(*def.Port)
@@ -193,14 +193,8 @@ func isSpawnRequestLive(p *Process) bool {
 // recordStarted writes the runtime fields of a freshly started process,
 // preserving its restart bookkeeping. If the definition vanished mid-start
 // (concurrently removed) it records nothing rather than recreating a stub.
-//
-// It is the single choke point for every new pid, so it also drops any
-// per-tick process-table snapshot: that snapshot predates this spawn and would
-// report the new pid as dead, which could restart a service twice in one tick.
-// Later lookups in the tick fall back to querying `ps` directly.
 func (m *Manager) recordStarted(name string, pid int, logPath string) {
 	st := processStartTime(pid)
-	m.setProcSnapshot(nil)
 	m.mutateProcess(name, func(p *Process) {
 		p.Pid = &pid
 		p.StartTime = &st
@@ -306,11 +300,14 @@ func (m *Manager) escalateKill(name string, pid, pgid int) error {
 	return nil
 }
 
-// freePortAfterStop best-effort frees a configured port after stopping, catching
-// orphaned children that escaped the process group.
+// freePortAfterStop gives a configured port a brief window to return to a
+// free state after an owned stop. It never signals anything: once the owned
+// process group is confirmed dead the kernel has already closed its sockets,
+// so a port that stays occupied is held by an unmanaged process that must be
+// left alone; the next start refuses to run rather than killing it.
 func (m *Manager) freePortAfterStop(name string) {
 	if def, ok := m.definition(name); ok && def.Port != nil && !isPortFree(*def.Port) {
-		forceFreePort(*def.Port)
+		waitForPortFree(*def.Port, PortReleaseWait)
 	}
 }
 
@@ -362,16 +359,17 @@ func (m *Manager) obliterateProcess(name string, pid int, markExplicit bool) err
 	return nil
 }
 
-// ensurePortFree verifies a port is free, force-killing holders, and errors if it
-// cannot be freed.
+// ensurePortFree verifies a configured port is free, waiting briefly for a
+// just-released socket to clear, and errors without signalling anything if it
+// is still occupied: auto never kills unmanaged port holders.
 func ensurePortFree(port *int, name string) error {
 	if port == nil || isPortFree(*port) {
 		return nil
 	}
-	if !forceFreePort(*port) {
+	if !waitForPortFree(*port, PortReleaseWait) {
 		return fmt.Errorf(
-			"cannot start %s: port %d still in use after killing all holders. Check: lsof -i :%d",
-			name, *port, *port)
+			"cannot start %s: port %d is held by another process; auto never kills unmanaged port holders",
+			name, *port)
 	}
 	return nil
 }

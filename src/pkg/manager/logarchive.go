@@ -37,8 +37,10 @@ func (m *Manager) maybeArchiveOldLogs() {
 		return
 	}
 	m.logArchiveBusy = true
+	m.logArchiveDone = make(chan struct{})
+	done := m.logArchiveDone
 	m.logArchiveMu.Unlock()
-	go m.runLogArchivePass()
+	go m.runLogArchivePass(done)
 }
 
 // logArchiveDueLocked reports whether a walk of the log tree is worth doing
@@ -62,7 +64,8 @@ func (m *Manager) logArchiveDueLocked(now time.Time) bool {
 // runLogArchivePass drains a budgeted batch of old logs, then records when the
 // pass ran and whether it hit its budget, and clears the busy flag so a later
 // tick can continue the backlog.
-func (m *Manager) runLogArchivePass() {
+func (m *Manager) runLogArchivePass(done chan struct{}) {
+	defer close(done)
 	archived := m.archiveOldLogs(MaxLogArchivesPerWatchTick)
 	m.logArchiveMu.Lock()
 	m.logArchiveLast = time.Now()
@@ -71,6 +74,17 @@ func (m *Manager) runLogArchivePass() {
 	m.logArchiveMu.Unlock()
 	if archived > 0 {
 		fmt.Printf("Archived %d old log file(s) to zip\n", archived)
+	}
+}
+
+// WaitForLogArchive waits for the currently running background log-archive
+// pass, if any. It is useful before releasing an ephemeral manager root.
+func (m *Manager) WaitForLogArchive() {
+	m.logArchiveMu.Lock()
+	done := m.logArchiveDone
+	m.logArchiveMu.Unlock()
+	if done != nil {
+		<-done
 	}
 }
 

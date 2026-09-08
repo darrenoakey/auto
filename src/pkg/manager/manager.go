@@ -30,6 +30,10 @@ const (
 	StartAllSpawnStagger = 200 * time.Millisecond
 	// MaxRestartsPerWatchTick spreads a post-reboot mass start over a few ticks.
 	MaxRestartsPerWatchTick = 5
+	// PortReleaseWait is how long a configured port is waited on after an owned
+	// stop, or before refusing a start, so the kernel's socket teardown for a
+	// just-killed process group is never mistaken for a standing occupier.
+	PortReleaseWait = 2 * time.Second
 	// SpawnRetryAttempts is how many times a transient spawn failure is retried.
 	SpawnRetryAttempts = 5
 	// SpawnRetryBaseDelay is multiplied by the attempt number between retries.
@@ -68,15 +72,9 @@ type Manager struct {
 	// on every one-second watch tick (see logArchiveDueLocked).
 	logArchiveMu      sync.Mutex
 	logArchiveBusy    bool
+	logArchiveDone    chan struct{}
 	logArchiveLast    time.Time
 	logArchiveBacklog bool
-
-	// procTable is the process-table snapshot serving the watch tick currently
-	// in flight, or nil outside a tick (and immediately after any spawn, which
-	// invalidates it). See proctable.go: it collapses two `ps` forks per
-	// managed service per tick into one for the whole tick.
-	procTableMu sync.Mutex
-	procTable   *procTable
 
 	// stateCache memoizes the parsed state file for read-only callers. The watch
 	// loop issues many per-service reads per tick; without this cache each one

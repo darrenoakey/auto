@@ -21,13 +21,17 @@ var transientSpawnErrnos = []error{syscall.EDEADLK, syscall.EAGAIN, syscall.ENOM
 // transient errno, the child shell's execve failing asynchronously (detected
 // by a transient marker in the log after the child dies within the grace
 // period), and the child losing a TOCTOU race for its port (detected by an
-// address-in-use marker in the log), in which case the port is forced free
-// before retrying so the restart converges within this single call instead of
-// bouncing through the caller's crash-restart backoff.
+// address-in-use marker in the log). A lost port race is retried only while
+// the configured port probes free; if another process still holds it, the
+// spawn refuses immediately — auto never kills unmanaged port holders — so
+// the restart converges the moment the holder is genuinely gone.
 func (m *Manager) spawnWithRetry(name, command, workdir string, port *int) (int, string, error) {
 	wrapped := "exec " + command
 	var lastErr error
 	for attempt := 0; attempt < SpawnRetryAttempts; attempt++ {
+		if err := refuseOccupiedPort(port, name); err != nil {
+			return 0, "", err
+		}
 		pid, logPath, offset, err := m.spawnOnce(name, wrapped, workdir)
 		if err != nil {
 			if !isTransientSpawnError(err) {
@@ -42,10 +46,12 @@ func (m *Manager) spawnWithRetry(name, command, workdir string, port *int) (int,
 			return pid, logPath, nil
 		}
 		if logHasAddressInUse(logPath, offset) {
-			lastErr = fmt.Errorf("%s: lost a race for its port, retrying", name)
-			if port != nil {
-				forceFreePort(*port)
+			if port != nil && !isPortFree(*port) {
+				return 0, "", fmt.Errorf(
+					"%s: lost a race for its port: port %d is held by another process; auto never kills unmanaged port holders",
+					name, *port)
 			}
+			lastErr = fmt.Errorf("%s: lost a race for its port, retrying", name)
 			sleepSpawnBackoff(name, attempt)
 			continue
 		}
@@ -65,6 +71,15 @@ func (m *Manager) spawnWithRetry(name, command, workdir string, port *int) (int,
 // the caller's liveness check. It returns the child pid, its log path, and the
 // byte offset at which this spawn's output begins (the file is appended to, so
 // the caller only inspects content written from offset onward).
+// refuseOccupiedPort ensures a pre-spawn port check never turns an unrelated
+// listener into a target: callers receive a policy error without signalling it.
+func refuseOccupiedPort(port *int, name string) error {
+	if port == nil || isPortFree(*port) {
+		return nil
+	}
+	return fmt.Errorf("%s: port %d is held by another process; auto never kills unmanaged port holders", name, *port)
+}
+
 func (m *Manager) spawnOnce(name, wrapped, workdir string) (int, string, int64, error) {
 	logPath := m.dailyLogPath(name)
 	offset := fileSize(logPath)

@@ -18,4 +18,5 @@ func TestRunTickSafelyRecoversFromEmptyState(t *testing.T) {
 	// A tick over an empty temp-rooted manager must not panic.
 	m := manager.New(t.TempDir())
 	runTickSafely(m)
+	m.WaitForLogArchive()
 }

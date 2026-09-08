@@ -2,7 +2,6 @@ package manager
 
 import (
 	"os/exec"
-	"strconv"
 	"syscall"
 	"testing"
 	"time"
@@ -174,18 +173,18 @@ func TestStopProcessMarksExplicitBeforeKilling(t *testing.T) {
 // RestartProcess call and asserts the service converges to exactly one live
 // instance holding its port, with no competing instance left running.
 func TestRestartProcessNotRacedByWatchTick(t *testing.T) {
-	if _, err := exec.LookPath("nc"); err != nil {
-		t.Skip("nc unavailable")
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Fatalf("python3 is required for the real listener test: %v", err)
 	}
 	m := newTestManager(t)
 	port := freeEphemeralPort(t)
-	mustAdd(t, m, "holder", "exec nc -l "+strconv.Itoa(port), &port)
+	mustAdd(t, m, "holder", listenerCommand(port, false), &port)
 	first, err := m.StartProcess("holder")
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
 	if !waitForPortHeld(port, 3*time.Second) {
-		t.Skip("nc did not bind the port (variant differs)")
+		t.Fatal("managed listener did not bind its configured port")
 	}
 
 	stop := make(chan struct{})
@@ -213,12 +212,14 @@ func TestRestartProcessNotRacedByWatchTick(t *testing.T) {
 	if second == first {
 		t.Fatalf("restart should yield a new pid, both %d", first)
 	}
+	if isProcessAlive(first) {
+		t.Fatalf("previous instance %d must be gone after restart", first)
+	}
 	if !waitForPortHeld(port, 3*time.Second) {
 		t.Fatal("port should be held after restart")
 	}
-	holders := lsofPortPids(port)
-	if len(holders) != 1 || holders[0] != second {
-		t.Fatalf("expected exactly pid %d holding port %d, got %v", second, port, holders)
+	if !endpointResponds(port) {
+		t.Fatal("the single surviving instance should answer on the port")
 	}
 	if pid, alive := m.Status("holder"); !alive || pid != second {
 		t.Fatalf("state should track the single survivor, got (%d,%v)", pid, alive)
