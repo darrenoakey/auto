@@ -105,6 +105,9 @@ func (m *Manager) archiveOldLogs(limit int) int {
 		if !isPlainLogFile(path, entry) {
 			return nil
 		}
+		if path == m.daemonLogPath() {
+			return nil
+		}
 		if !shouldArchiveLog(path, today) {
 			return nil
 		}
@@ -116,6 +119,18 @@ func (m *Manager) archiveOldLogs(limit int) int {
 		return nil
 	})
 	return archived
+}
+
+// daemonLogPath is the watch daemon's own stdout/stderr file, fixed by the
+// LaunchAgent this project installs (see pkg/install). launchd opens it once
+// at load and never reopens it, so archiving it unlinks the file the live
+// daemon is still writing through: supervision output then goes to a deleted
+// inode and the operator record of every restart silently disappears. It also
+// has no date in its name, so the daily-log guard cannot protect it — the
+// mtime branch archives it at the first pass after any midnight whose last
+// message landed before the day rolled. Never archive it.
+func (m *Manager) daemonLogPath() string {
+	return filepath.Join(m.logDir(), "auto", "auto.log")
 }
 
 // isPlainLogFile reports whether entry is a regular *.log file (not a .log.zip).

@@ -326,3 +326,69 @@ func assertZipContains(t *testing.T, zipPath, entryName, wantBody string) {
 		t.Fatalf("zip body = %q, want %q", got, wantBody)
 	}
 }
+
+// TestArchiveSkipsDaemonOwnLog pins the evidence-preservation fix with a real
+// open file descriptor, the way launchd holds the daemon's stdout: the
+// archiver must leave <logs>/auto/auto.log alone even though it carries no
+// date and was last written before today, because unlinking it sends every
+// later supervision message to a deleted inode. Sibling dateless logs are
+// still archived, so the skip is targeted rather than a blanket exemption.
+func TestArchiveSkipsDaemonOwnLog(t *testing.T) {
+	m := newTestManager(t)
+	yesterday := time.Now().Add(-26 * time.Hour)
+
+	daemonLog := filepath.Join(m.logDir(), "auto", "auto.log")
+	if err := os.MkdirAll(filepath.Dir(daemonLog), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(daemonLog, []byte("Restarted svc with pid 1 after 2s backoff\n"), 0o644); err != nil {
+		t.Fatalf("write daemon log: %v", err)
+	}
+	if err := os.Chtimes(daemonLog, yesterday, yesterday); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	// A dateless log belonging to a managed service, same shape, same age.
+	otherLog := filepath.Join(m.logDir(), "svc", "svc.log")
+	if err := os.MkdirAll(filepath.Dir(otherLog), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(otherLog, []byte("service output\n"), 0o644); err != nil {
+		t.Fatalf("write service log: %v", err)
+	}
+	if err := os.Chtimes(otherLog, yesterday, yesterday); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	// Hold the daemon log open for append exactly as launchd does, then
+	// archive, then keep writing through the same descriptor.
+	handle, err := os.OpenFile(daemonLog, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open daemon log: %v", err)
+	}
+	defer func() { _ = handle.Close() }()
+
+	m.archiveOldLogs(0)
+
+	if _, err := handle.WriteString("Restarted svc with pid 2 after 4s backoff\n"); err != nil {
+		t.Fatalf("write through held descriptor: %v", err)
+	}
+
+	if _, err := os.Stat(daemonLog + ".zip"); err == nil {
+		t.Fatal("the daemon's own log must never be archived")
+	}
+	data, err := os.ReadFile(daemonLog)
+	if err != nil {
+		t.Fatalf("daemon log must still exist at its path: %v", err)
+	}
+	if !strings.Contains(string(data), "pid 2 after 4s backoff") {
+		t.Fatalf("messages written after the archive pass must still reach the daemon log, got:\n%s", data)
+	}
+
+	if _, err := os.Stat(otherLog + ".zip"); err != nil {
+		t.Fatalf("an ordinary dateless service log should still be archived: %v", err)
+	}
+	if _, err := os.Stat(otherLog); !os.IsNotExist(err) {
+		t.Fatalf("an archived service log should be removed, stat err = %v", err)
+	}
+}
