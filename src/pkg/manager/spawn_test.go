@@ -294,3 +294,58 @@ func TestIsTransientSpawnError(t *testing.T) {
 		t.Fatal("ENOENT should not be transient")
 	}
 }
+
+// TestSpawnAddressInUseWithoutPortRefusesInsteadOfRetrying pins the busy-loop
+// fix with a real standing occupier: a service whose registry row carries no
+// port really loses its bind to a real listener. auto cannot probe an address
+// it was never told about, so it must refuse rather than assume the occupier
+// is momentary — and above all it must spawn the doomed child ONCE, not
+// SpawnRetryAttempts times, every supervision cycle for as long as the
+// occupier lives.
+func TestSpawnAddressInUseWithoutPortRefusesInsteadOfRetrying(t *testing.T) {
+	m := newTestManager(t)
+	port := freeEphemeralPort(t)
+	startUnownedListener(t, port)
+	if !waitForPortHeld(port, 3*time.Second) {
+		t.Fatal("unmanaged listener did not bind the port the service will lose")
+	}
+
+	_, _, err := m.spawnWithRetry("svc-no-port", listenerCommand(port, false), "", nil)
+	if err == nil {
+		t.Fatal("spawn must refuse when the child reports address already in use and no port is configured")
+	}
+	if !strings.Contains(err.Error(), "no port is configured") {
+		t.Fatalf("refusal should name the missing port configuration, got: %v", err)
+	}
+
+	logPath := m.dailyLogPath("svc-no-port")
+	data, readErr := os.ReadFile(logPath)
+	if readErr != nil {
+		t.Fatalf("read service log: %v", readErr)
+	}
+	binds := strings.Count(strings.ToLower(string(data)), "address already in use")
+	if binds != 1 {
+		t.Fatalf("child should have been spawned exactly once, but its log records %d failed binds:\n%s", binds, data)
+	}
+}
+
+// TestSpawnAddressInUseWithConfiguredPortStillRefusesStandingHolder keeps the
+// configured-port branch honest alongside the no-port refusal above: when the
+// port IS known and a real process still holds it, the refusal names the
+// no-kill policy rather than the missing configuration.
+func TestSpawnAddressInUseWithConfiguredPortStillRefusesStandingHolder(t *testing.T) {
+	m := newTestManager(t)
+	port := freeEphemeralPort(t)
+	startUnownedListener(t, port)
+	if !waitForPortHeld(port, 3*time.Second) {
+		t.Fatal("unmanaged listener did not bind its port")
+	}
+
+	_, _, err := m.spawnWithRetry("svc-with-port", listenerCommand(port, false), "", &port)
+	if err == nil {
+		t.Fatal("spawn must refuse while a real process holds the configured port")
+	}
+	if !strings.Contains(err.Error(), "never kills unmanaged port holders") {
+		t.Fatalf("refusal should name the no-kill policy, got: %v", err)
+	}
+}

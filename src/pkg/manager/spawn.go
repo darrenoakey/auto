@@ -25,6 +25,14 @@ var transientSpawnErrnos = []error{syscall.EDEADLK, syscall.EAGAIN, syscall.ENOM
 // the configured port probes free; if another process still holds it, the
 // spawn refuses immediately — auto never kills unmanaged port holders — so
 // the restart converges the moment the holder is genuinely gone.
+//
+// An address-in-use child with NO configured port is refused, not retried:
+// auto has nothing to probe, so it cannot distinguish a momentary race from a
+// standing occupier, and guessing "momentary" turns a permanently unstartable
+// service into a silent busy-loop — five spawns per supervision cycle, for as
+// long as the occupier lives. Refusing keeps the outer restart backoff as the
+// single retry ladder, so a genuinely momentary race still converges while a
+// standing occupier is reported instead of hidden.
 func (m *Manager) spawnWithRetry(name, command, workdir string, port *int) (int, string, error) {
 	wrapped := "exec " + command
 	var lastErr error
@@ -46,7 +54,12 @@ func (m *Manager) spawnWithRetry(name, command, workdir string, port *int) (int,
 			return pid, logPath, nil
 		}
 		if logHasAddressInUse(logPath, offset) {
-			if port != nil && !isPortFree(*port) {
+			if port == nil {
+				return 0, "", fmt.Errorf(
+					"%s: bind failed with address already in use, but no port is configured for it, so auto cannot tell a momentary race from a standing occupier; refusing to retry. Register the service's port (auto update %s --port N) so the holder can be probed",
+					name, name)
+			}
+			if !isPortFree(*port) {
 				return 0, "", fmt.Errorf(
 					"%s: lost a race for its port: port %d is held by another process; auto never kills unmanaged port holders",
 					name, *port)
