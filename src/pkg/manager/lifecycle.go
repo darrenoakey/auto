@@ -62,6 +62,26 @@ func (m *Manager) StartProcess(name string) (int, error) {
 // recorded to delegate to (e.g. before the daemon has ticked for the first
 // time, or in an isolated test Manager whose state file no watch loop ticks).
 func (m *Manager) spawnDirect(name string, def *Process) (int, error) {
+	return m.spawnDirectWith(name, def, m.spawnWithRetry)
+}
+
+// spawnDirectOverlap is spawnDirect for a REPLACEMENT instance that must bind
+// beside a still-running one: it uses the overlap spawn variant, which skips
+// the pre-spawn port-free guard and treats address-in-use as a deterministic
+// failure rather than a retryable race.
+func (m *Manager) spawnDirectOverlap(name string, def *Process) (int, error) {
+	return m.spawnDirectWith(name, def, m.spawnWithRetryOverlap)
+}
+
+// spawnDirectWith claims the start, performs the spawn via the given spawn
+// function, and records the resulting pid. The claim is what keeps a
+// concurrent WatchTick from starting a competing copy while the entry still
+// reads as dead or while the overlap request has not landed yet.
+func (m *Manager) spawnDirectWith(
+	name string,
+	def *Process,
+	spawn func(name, command, workdir string, port *int) (int, string, error),
+) (int, error) {
 	// Claim the start before spawning: for the whole spawn window the entry
 	// still has Pid=nil, and a concurrent WatchTick reading that would start a
 	// competing copy (observed: `auto add` and the watch loop each spawning one
@@ -70,7 +90,7 @@ func (m *Manager) spawnDirect(name string, def *Process) (int, error) {
 	if !m.claimStart(name) {
 		return 0, fmt.Errorf("process %s is already starting", name)
 	}
-	pid, logPath, err := m.spawnWithRetry(name, def.Command, def.Workdir, def.Port)
+	pid, logPath, err := spawn(name, def.Command, def.Workdir, def.Port)
 	if err != nil {
 		m.clearStartClaim(name)
 		return 0, err
@@ -407,4 +427,124 @@ func (m *Manager) RestartProcess(name string) (int, error) {
 	}
 	m.resetRestartAttempt(name)
 	return pid, nil
+}
+
+// OverlapSpawnRequestTTL bounds how long a delegated overlap spawn request
+// waits for the watch daemon to fulfill it. It must exceed the worst-case
+// overlap spawn budget (SpawnRetryAttempts attempts including backoff plus
+// SpawnVerifyDelay each, roughly 7s) plus one slow watch tick, so a
+// slow-but-legitimate spawn is never mistaken for an abandoned request and
+// never races the caller's serial-restart fallback.
+const OverlapSpawnRequestTTL = 15 * time.Second
+
+// isOverlapSpawnRequestLive reports whether an overlap spawn request is
+// present and still within OverlapSpawnRequestTTL. Mirrors isSpawnRequestLive:
+// an expired request is stale and discarded rather than fulfilled.
+func isOverlapSpawnRequestLive(p *Process) bool {
+	if p == nil || p.OverlapSpawnRequestedAt == nil {
+		return false
+	}
+	return nowUnix()-*p.OverlapSpawnRequestedAt < OverlapSpawnRequestTTL.Seconds()
+}
+
+// clearOverlapSpawnRequest releases a delegated overlap spawn request, whether
+// fulfilled, refused, or discarded as stale.
+func (m *Manager) clearOverlapSpawnRequest(name string) {
+	m.mutateProcess(name, func(p *Process) { p.OverlapSpawnRequestedAt = nil })
+}
+
+// delegateOverlapSpawnToDaemon asks the watch daemon to spawn a replacement
+// instance beside the running one (same state-file handshake as
+// delegateSpawnToDaemon) and waits until the recorded pid CHANGES — the
+// daemon-side half (fulfillOverlapSpawnRequest) records the replacement via
+// recordStarted while the original instance keeps serving. If the replacement
+// cannot bind beside the old instance (its listener does not allow port
+// reuse), the daemon refuses the spawn and the pid never changes; the TTL then
+// expires and the caller falls back to the serial restart.
+func (m *Manager) delegateOverlapSpawnToDaemon(name string) (int, error) {
+	previousPid, _ := m.processStatus(name)
+	m.mutateProcess(name, func(p *Process) {
+		now := nowUnix()
+		p.OverlapSpawnRequestedAt = &now
+	})
+	deadline := time.Now().Add(OverlapSpawnRequestTTL)
+	for time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+		if pid, alive := m.processStatus(name); alive && pid != previousPid {
+			return pid, nil
+		}
+	}
+	// Retract the request so a late daemon tick cannot spawn a duplicate after
+	// the caller has already converged via the serial path. A tick that read
+	// the request before this clear may still spawn once; the start claim and
+	// the caller's subsequent port conflict surface that as a visible error
+	// rather than a silent duplicate.
+	m.clearOverlapSpawnRequest(name)
+	return 0, fmt.Errorf(
+		"watch daemon did not overlap-spawn %s within %s; falling back to serial restart",
+		name, OverlapSpawnRequestTTL)
+}
+
+// spawnReplacement spawns one replacement instance of name beside its recorded
+// live instance. Unlike StartProcess it skips the port-free guard (the running
+// instance deliberately keeps holding the port while the replacement binds
+// beside it) and refuses to treat the alive entry as "already running".
+// Delegation to the watch daemon matches StartProcess: only the daemon's own
+// fork/exec produces a child owned by the signed Auto.app identity.
+func (m *Manager) spawnReplacement(name string) (int, error) {
+	def, ok := m.definition(name)
+	if !ok {
+		return 0, fmt.Errorf("process %s not found in config", name)
+	}
+	if daemonPid := m.liveDaemon(); daemonPid != 0 && daemonPid != os.Getpid() {
+		return m.delegateOverlapSpawnToDaemon(name)
+	}
+	return m.spawnDirectOverlap(name, def)
+}
+
+// RestartProcessOverlap replaces a LIVE process without a connection-refused
+// window on its configured port. The replacement spawns FIRST and binds beside
+// the running instance — which must hold its listener with SO_REUSEPORT (the
+// availability contract of port-forwarding services like postgres-tunnel) —
+// and only then is the old instance terminated. Clients that connect during
+// the swap are served by one instance or the other, so a deploy of the
+// service's own binary no longer pauses the port.
+//
+// Fallbacks keep the operation total: a dead or stopped process takes the
+// classic serial RestartProcess path (nothing to overlap), and a replacement
+// that cannot bind beside the old instance (the running binary predates port
+// reuse, or a foreign process holds the port) fails fast and falls back to the
+// serial path, which converges as soon as the port is genuinely free.
+// Launchd-isolated processes have their own restart path and reject overlap.
+func (m *Manager) RestartProcessOverlap(name string) (int, error) {
+	def, ok := m.definition(name)
+	if !ok {
+		return 0, fmt.Errorf("process %s not found in config", name)
+	}
+	if def.Isolate {
+		return 0, fmt.Errorf("overlap restart is not supported for launchd-isolated process %s", name)
+	}
+	oldPid, alive := m.processStatus(name)
+	if !alive {
+		return m.RestartProcess(name)
+	}
+	newPid, err := m.spawnReplacement(name)
+	if err != nil {
+		// The replacement could not take the port beside the running instance.
+		// Converge the classic way: stop, wait for port release, start.
+		return m.RestartProcess(name)
+	}
+	// The replacement is recorded and serving; the entry pid already points at
+	// it, so the watch loop supervises the replacement from here and nothing
+	// references the old pid except this teardown. No explicit-stop is set:
+	// killing the old instance must not (and cannot) trip the watch loop into
+	// a respawn, because the watched pid is the replacement's.
+	if pgid, pgidErr := syscall.Getpgid(oldPid); pgidErr == nil {
+		if err := m.terminateProcessGroup(name, oldPid, pgid); err != nil {
+			return 0, err
+		}
+	}
+	// A Getpgid failure means the old instance already exited on its own;
+	// the replacement is serving either way.
+	return newPid, nil
 }

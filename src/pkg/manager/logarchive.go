@@ -95,7 +95,17 @@ func (m *Manager) WaitForLogArchive() {
 func (m *Manager) archiveOldLogs(limit int) int {
 	today := startOfLocalDay(time.Now())
 	archived := 0
-	_ = filepath.WalkDir(m.logDir(), func(path string, entry fs.DirEntry, walkErr error) error {
+	// Inspect the log tree WITHOUT creating it: logDir() is a creating getter
+	// (spawn paths rely on that), but this pass runs in a background goroutine
+	// that can easily outlive the test (or daemon shutdown) that triggered it,
+	// and re-creating the tree mid-RemoveAll made ephemeral roots flakily
+	// fail their cleanup with "directory not empty". A missing tree has
+	// nothing to archive.
+	logRoot := filepath.Join(m.root, "output", "logs")
+	if _, err := os.Stat(logRoot); err != nil {
+		return 0
+	}
+	_ = filepath.WalkDir(logRoot, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil || entry.IsDir() {
 			return nil
 		}

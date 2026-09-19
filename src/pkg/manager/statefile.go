@@ -47,6 +47,17 @@ type Process struct {
 	// finds it already alive, or discards it as stale). Omitted from JSON
 	// when unset, so existing state files load unchanged.
 	SpawnRequestedAt *float64 `json:"spawn_requested_at,omitempty"`
+	// OverlapSpawnRequestedAt marks a pending delegated OVERLAP spawn request
+	// (auto restart <name> --overlap) from an external CLI invocation. Unlike
+	// SpawnRequestedAt, a live recorded instance is expected when this request
+	// is fulfilled: the replacement must spawn and bind BESIDE the running
+	// process (which holds its listener with SO_REUSEPORT) so the caller can
+	// retire the old instance with no connection-refused window on the port.
+	// Set by delegateOverlapSpawnToDaemon, cleared by fulfillOverlapSpawnRequest
+	// once the daemon spawns the replacement (or discards the request as stale,
+	// or the replacement's bind fails). Omitted from JSON when unset, so
+	// existing state files load unchanged.
+	OverlapSpawnRequestedAt *float64 `json:"overlap_spawn_requested_at,omitempty"`
 	// Isolate marks a process as launchd-managed instead of daemon-managed:
 	// StartProcess/StopProcess/RestartProcess/processStatus all delegate to
 	// isolate.go, which registers a dedicated per-process LaunchAgent

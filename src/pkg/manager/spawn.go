@@ -80,6 +80,52 @@ func (m *Manager) spawnWithRetry(name, command, workdir string, port *int) (int,
 	return 0, "", fmt.Errorf("cannot start %s: no spawn attempts were made", name)
 }
 
+// spawnWithRetryOverlap is the spawn variant for a REPLACEMENT instance that
+// must bind beside a still-running one (see RestartProcessOverlap). It skips
+// the pre-spawn port-free guard — the old instance deliberately keeps holding
+// the port — and treats an address-in-use death as the deterministic outcome
+// it is: the running listener does not allow port reuse, so retrying cannot
+// converge and the caller falls back to the serial restart. Transient host
+// fork/exec failures are retried exactly as in spawnWithRetry.
+func (m *Manager) spawnWithRetryOverlap(name, command, workdir string, port *int) (int, string, error) {
+	wrapped := "exec " + command
+	var lastErr error
+	for attempt := 0; attempt < SpawnRetryAttempts; attempt++ {
+		pid, logPath, offset, err := m.spawnOnce(name, wrapped, workdir)
+		if err != nil {
+			if !isTransientSpawnError(err) {
+				return 0, "", err
+			}
+			lastErr = err
+			sleepSpawnBackoff(name, attempt)
+			continue
+		}
+		if childStillRunning(pid) {
+			reapWhenDone(pid)
+			return pid, logPath, nil
+		}
+		if logHasAddressInUse(logPath, offset) {
+			if port != nil {
+				return 0, "", fmt.Errorf(
+					"%s: replacement bind failed with address already in use on port %d; the running instance's listener does not allow port reuse",
+					name, *port)
+			}
+			return 0, "", fmt.Errorf(
+				"%s: replacement bind failed with address already in use; the running instance's listener does not allow port reuse",
+				name)
+		}
+		if !logHasTransientExecError(logPath, offset) {
+			return 0, "", fmt.Errorf("%s: replacement exited fast for a non-transient reason", name)
+		}
+		lastErr = fmt.Errorf("%s: shell execve failed transiently", name)
+		sleepSpawnBackoff(name, attempt)
+	}
+	if lastErr != nil {
+		return 0, "", lastErr
+	}
+	return 0, "", fmt.Errorf("cannot start %s: no spawn attempts were made", name)
+}
+
 // spawnOnce performs a single fork/exec and waits the grace period implicitly via
 // the caller's liveness check. It returns the child pid, its log path, and the
 // byte offset at which this spawn's output begins (the file is appended to, so

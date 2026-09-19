@@ -9,7 +9,13 @@ import (
 // newTestManager returns a Manager rooted at a fresh temporary directory.
 func newTestManager(t *testing.T) *Manager {
 	t.Helper()
-	return New(t.TempDir())
+	m := New(t.TempDir())
+	// A WatchTick may have launched a background log-archive pass; do not let
+	// it outlive the test and race t.TempDir()'s RemoveAll (live 2026-09-19:
+	// TestWatchTickRecordsHeartbeat flaked "directory not empty" on a loaded
+	// machine because the pass's goroutine ran after the test returned).
+	t.Cleanup(m.WaitForLogArchive)
+	return m
 }
 
 // mustAdd registers a process definition or fails the test.

@@ -67,7 +67,15 @@ service's cwd is always a configured, visible property (`auto show` prints it).
 auto start myapp
 auto stop myapp
 auto restart myapp
+auto restart --overlap myapp
 ```
+
+`restart --overlap` replaces a LIVE process with no connection-refused window
+on its port: the replacement spawns first and binds beside the running
+instance (which must hold its listener with SO_REUSEPORT), and only then is
+the old instance terminated, so clients are served by one instance or the
+other throughout. If the replacement cannot bind beside the old instance, the
+command falls back to the classic serial restart.
 
 ### View Process Details
 
@@ -262,7 +270,7 @@ auto ps
 | `ps` | List all processes with their status |
 | `start <name>` | Start a configured process |
 | `stop <name>` | Stop a running process |
-| `restart <name>` | Stop and start a process |
+| `restart <name> [--overlap]` | Stop and start a process; `--overlap` swaps with zero port downtime (requires SO_REUSEPORT listener) |
 | `add <name> <command> [--port PORT] [--workdir DIR] [--isolate on\|off]` | Add a new process and start it |
 | `update <name> [--port PORT] [--workdir DIR] [--isolate on\|off]` | Update process settings |
 | `remove <name>` | Stop and remove a process |

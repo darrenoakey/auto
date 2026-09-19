@@ -22,6 +22,10 @@ func (m *Manager) WatchTick() {
 		if def, ok := m.definition(name); ok && def.Isolate {
 			continue
 		}
+		if restarts < MaxRestartsPerWatchTick && m.fulfillOverlapSpawnRequest(name) {
+			restarts++
+			continue
+		}
 		if restarts < MaxRestartsPerWatchTick && m.fulfillSpawnRequest(name) {
 			restarts++
 			continue
@@ -51,6 +55,35 @@ func (m *Manager) recordHeartbeat() {
 		data.DaemonPid = &pid
 		return true
 	})
+}
+
+// fulfillOverlapSpawnRequest performs a pending delegated OVERLAP spawn
+// request for name, if one is live. It is the daemon-side half of
+// delegateOverlapSpawnToDaemon (see RestartProcessOverlap): only the watch
+// daemon's own process calls this, so the replacement child always inherits
+// Auto.app's macOS responsible-process identity. Unlike fulfillSpawnRequest an
+// alive recorded instance is EXPECTED here — the request exists precisely
+// because the old instance must keep serving while its replacement spawns and
+// binds beside it; the caller retires the old instance afterwards.
+func (m *Manager) fulfillOverlapSpawnRequest(name string) bool {
+	def, ok := m.definition(name)
+	if !ok || def.OverlapSpawnRequestedAt == nil {
+		return false
+	}
+	if !isOverlapSpawnRequestLive(def) {
+		// Abandoned: the requester gave up (or died) before we reached it.
+		m.clearOverlapSpawnRequest(name)
+		return false
+	}
+	pid, err := m.spawnDirectOverlap(name, def)
+	m.clearOverlapSpawnRequest(name)
+	if err != nil {
+		fmt.Printf("Failed to fulfill delegated overlap spawn request for %s: %v\n", name, err)
+		return false
+	}
+	m.resetRestartAttempt(name)
+	fmt.Printf("Fulfilled delegated overlap spawn request for %s with pid %d\n", name, pid)
+	return true
 }
 
 // fulfillSpawnRequest performs a pending delegated spawn request for name, if
