@@ -58,6 +58,20 @@ type Process struct {
 	// or the replacement's bind fails). Omitted from JSON when unset, so
 	// existing state files load unchanged.
 	OverlapSpawnRequestedAt *float64 `json:"overlap_spawn_requested_at,omitempty"`
+	// StrictOverlapRequestId identifies a fail-closed overlap request. Its
+	// companion fields let the watcher claim, finish, or cancel exactly one
+	// request without a timed-out caller racing a late replacement spawn.
+	StrictOverlapRequestId          string   `json:"strict_overlap_request_id,omitempty"`
+	StrictOverlapRequestedAt        *float64 `json:"strict_overlap_requested_at,omitempty"`
+	StrictOverlapDeadline           *float64 `json:"strict_overlap_deadline,omitempty"`
+	StrictOverlapOriginalPid        *int     `json:"strict_overlap_original_pid,omitempty"`
+	StrictOverlapOriginalStartTime  *string  `json:"strict_overlap_original_start_time,omitempty"`
+	StrictOverlapClaimed            bool     `json:"strict_overlap_claimed,omitempty"`
+	StrictOverlapCancelled          bool     `json:"strict_overlap_cancelled,omitempty"`
+	StrictOverlapCandidatePid       *int     `json:"strict_overlap_candidate_pid,omitempty"`
+	StrictOverlapCandidateStartTime *string  `json:"strict_overlap_candidate_start_time,omitempty"`
+	StrictOverlapResultPid          *int     `json:"strict_overlap_result_pid,omitempty"`
+	StrictOverlapError              string   `json:"strict_overlap_error,omitempty"`
 	// Isolate marks a process as launchd-managed instead of daemon-managed:
 	// StartProcess/StopProcess/RestartProcess/processStatus all delegate to
 	// isolate.go, which registers a dedicated per-process LaunchAgent

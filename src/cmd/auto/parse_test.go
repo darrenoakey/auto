@@ -27,6 +27,16 @@ func TestParseArgsBoolFlags(t *testing.T) {
 	}
 }
 
+func TestParseArgsStrictOverlapFlag(t *testing.T) {
+	parsed, err := parseArgs([]string{"svc", "--strict-overlap"}, nil, boolSet("overlap", "strict-overlap"))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !parsed.bools["strict-overlap"] || parsed.bools["overlap"] {
+		t.Fatalf("bools wrong: %v", parsed.bools)
+	}
+}
+
 func TestParseArgsRecognizesIsolateForAddAndUpdate(t *testing.T) {
 	p, err := parseArgs([]string{"svc", "sleep", "300", "--isolate", "on"}, valueSet("port", "restart-every", "isolate"), nil)
 	if err != nil {

@@ -68,6 +68,7 @@ auto start myapp
 auto stop myapp
 auto restart myapp
 auto restart --overlap myapp
+auto restart --strict-overlap myapp
 ```
 
 `restart --overlap` replaces a LIVE process with no connection-refused window
@@ -76,6 +77,14 @@ instance (which must hold its listener with SO_REUSEPORT), and only then is
 the old instance terminated, so clients are served by one instance or the
 other throughout. If the replacement cannot bind beside the old instance, the
 command falls back to the classic serial restart.
+
+`restart --strict-overlap` uses the same watcher-owned replacement mechanism
+but fails closed: it requires a live old process, never falls back to a serial
+restart, and leaves the old PID, listener, and runtime metadata intact when the
+replacement cannot start. `--overlap` and `--strict-overlap` are mutually
+exclusive. Strict overlap preserves listener admission during a successful
+swap, but it is not a coordinated drain protocol: existing connections owned
+by the old process still close when that process terminates normally.
 
 ### View Process Details
 
@@ -270,7 +279,7 @@ auto ps
 | `ps` | List all processes with their status |
 | `start <name>` | Start a configured process |
 | `stop <name>` | Stop a running process |
-| `restart <name> [--overlap]` | Stop and start a process; `--overlap` swaps with zero port downtime (requires SO_REUSEPORT listener) |
+| `restart <name> [--overlap\|--strict-overlap]` | Stop and start a process; strict overlap fails without stopping the old live process (requires SO_REUSEPORT listener) |
 | `add <name> <command> [--port PORT] [--workdir DIR] [--isolate on\|off]` | Add a new process and start it |
 | `update <name> [--port PORT] [--workdir DIR] [--isolate on\|off]` | Update process settings |
 | `remove <name>` | Stop and remove a process |

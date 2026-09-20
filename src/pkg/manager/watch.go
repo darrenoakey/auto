@@ -22,6 +22,10 @@ func (m *Manager) WatchTick() {
 		if def, ok := m.definition(name); ok && def.Isolate {
 			continue
 		}
+		if restarts < MaxRestartsPerWatchTick && m.fulfillStrictOverlapSpawnRequest(name) {
+			restarts++
+			continue
+		}
 		if restarts < MaxRestartsPerWatchTick && m.fulfillOverlapSpawnRequest(name) {
 			restarts++
 			continue

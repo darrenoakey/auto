@@ -1,6 +1,8 @@
 package main
 
 import (
+	"auto/pkg/manager"
+	"io"
 	"os"
 	"os/exec"
 	"reflect"
@@ -29,6 +31,34 @@ func TestToSet(t *testing.T) {
 func TestRunWithNoArgsReturnsUsageCode(t *testing.T) {
 	if code := run(nil); code != 2 {
 		t.Fatalf("run(nil) = %d, want 2", code)
+	}
+}
+
+func TestRestartOverlapModesAreMutuallyExclusive(t *testing.T) {
+	manager := manager.New(t.TempDir())
+	if code := dispatch(manager, "restart", []string{"svc", "--overlap", "--strict-overlap"}); code != 1 {
+		t.Fatalf("dispatch returned %d, want 1", code)
+	}
+}
+
+func TestUsageDocumentsStrictOverlap(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	original := os.Stdout
+	os.Stdout = writer
+	usage()
+	os.Stdout = original
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close usage writer: %v", err)
+	}
+	output, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read usage: %v", err)
+	}
+	if !strings.Contains(string(output), "--overlap|--strict-overlap") {
+		t.Fatalf("usage missing strict overlap: %q", output)
 	}
 }
 

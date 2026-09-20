@@ -90,12 +90,14 @@ func cmdStop(m *manager.Manager, name string) int {
 // cmdRestart restarts a process. With overlap, the replacement spawns and
 // binds beside the running instance first (which must hold its listener with
 // SO_REUSEPORT), so the port never refuses connections during the swap.
-func cmdRestart(m *manager.Manager, name string, overlap bool) int {
+func cmdRestart(m *manager.Manager, name string, overlap, strictOverlap bool) int {
 	var (
 		pid int
 		err error
 	)
-	if overlap {
+	if strictOverlap {
+		pid, err = m.RestartProcessStrictOverlap(name)
+	} else if overlap {
 		pid, err = m.RestartProcessOverlap(name)
 	} else {
 		pid, err = m.RestartProcess(name)
