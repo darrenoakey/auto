@@ -34,9 +34,11 @@ grant never stuck and the app never appeared in System Settings.
 The fix is structural:
 - `Auto.app` is a real bundle with `CFBundleIdentifier`,
   `NSLocalNetworkUsageDescription`, `NSRemovableVolumesUsageDescription`, and
-  `NSRemindersUsageDescription`, signed with a **stable** Apple Development
-  identity (TCC keys on Team ID + bundle id, constant across rebuilds - see
-  `~/src/sparkview`).
+  `NSRemindersUsageDescription`, signed with the **stable** Developer ID
+  Application identity for Team `58MF5GATL7` (TCC keys on Team ID + bundle id,
+  constant across rebuilds). The identity is read through the public
+  `daz-secrets` Go SDK, validated in memory, and sent to `rcodesign` through an
+  anonymous descriptor; builds fail closed without Keychain or ad-hoc signing.
 - launchd execs the signed binary **directly** (`ProgramArguments` =
   `Auto.app/Contents/MacOS/auto watch`), so `auto` is its OWN responsible process.
 - Every service `auto` spawns inherits `auto` as the responsible process, so one
@@ -55,6 +57,8 @@ OWN signed LaunchAgent, not under auto.
 
 - `cmd/auto` — CLI dispatch, watch loop (SIGTERM → clean teardown), banner, App Nap
   opt-out (CGo, darwin), and the `bundle/Info.plist` for the app bundle.
+- `cmd/auto-sign`, `pkg/signing` — fail-closed Developer ID bundle signing and
+  Mach-O verification without putting credentials in argv, env, files, or Keychain.
 - `pkg/manager` — all supervision logic on a `Manager` rooted at the project tree.
 - `pkg/install` — writes `~/bin/auto`, generates + loads the LaunchAgent plist.
 

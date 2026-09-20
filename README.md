@@ -23,6 +23,16 @@ cd auto
 
 The installer creates a global `auto` command in `~/bin` and sets up a LaunchAgent so the watcher runs automatically on login.
 
+Building requires `rcodesign` at `~/.cargo/bin/rcodesign` and the public Go
+`daz-secrets` SDK. The Developer ID PKCS#12 and its password remain in the
+configured machine-local provider under
+`app-publish/developer_id_application_p12` and
+`app-publish/developer_id_application_p12_password`. Auto decrypts and validates
+the identity in memory, then passes the resulting key and certificate to
+`rcodesign` through an anonymous file descriptor; it never imports the identity
+into Keychain. A missing secret, wrong Team ID, signing failure, or verification
+failure aborts the build without producing an ad-hoc bundle.
+
 If `~/bin` is not in your PATH, add this to your shell profile:
 
 ```bash

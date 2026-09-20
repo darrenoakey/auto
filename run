@@ -13,7 +13,6 @@ BIN_DIR="$OUTPUT_DIR/bin"
 TEST_DIR="$OUTPUT_DIR/testing"
 APP_BUNDLE="$OUTPUT_DIR/Auto.app"
 APP_EXE="$APP_BUNDLE/Contents/MacOS/auto"
-BUNDLE_ID="com.darrenoakey.auto"
 LAUNCH_AGENT_LABEL="com.darrenoakey.auto"
 LAUNCH_AGENT_TARGET="gui/$(id -u)/$LAUNCH_AGENT_LABEL"
 CANONICAL_DIR="/Users/darrenoakey/local/auto"
@@ -39,30 +38,12 @@ usage() {
     exit 1
 }
 
-# signing_identity finds a STABLE code-signing identity (Apple Development /
-# Developer ID for Darren Oakey). A stable identity is what makes the macOS Local
-# Network grant survive rebuilds: TCC keys on the Designated Requirement (Team ID
-# + bundle id), constant across builds and cert renewals. Falls back to ad-hoc
-# ("-") with a warning — ad-hoc changes identity every build so the grant would
-# NOT persist.
-signing_identity() {
-    local id
-    id="$( (security find-identity -v -p codesigning 2>/dev/null \
-            | grep -E "Apple Development: Darren Oakey|Developer ID Application: " \
-            | head -1 | awk '{print $2}') || true )"
-    if [ -n "$id" ]; then
-        echo "$id"
-    else
-        echo "-"
-    fi
-}
-
 cmd_build() {
     echo "==> Building..."
     cd "$SRC_DIR"
     for dir in cmd/*/; do
         name=$(basename "$dir")
-        go build -o "$BIN_DIR/$name" "./$dir"
+        go build -ldflags "-s -w" -o "$BIN_DIR/$name" "./$dir"
         echo "    Built $name -> output/bin/$name"
     done
     cmd_bundle
@@ -73,22 +54,60 @@ cmd_build() {
 # with a stable identity + fixed bundle id, so macOS attributes Local Network
 # access to the bundle (not a launcher) and the user's one-time grant persists.
 cmd_bundle() {
-    local id; id="$(signing_identity)"
-    echo "==> Bundling Auto.app (sign id: $id)"
-    rm -rf "$APP_BUNDLE"
-    mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
-    cp "$BIN_DIR/auto" "$APP_EXE"
-    cp "$SRC_DIR/cmd/auto/bundle/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
-    if [ "$id" = "-" ]; then
-        echo "    WARNING: no stable signing identity found; ad-hoc signing — the"
-        echo "             Local Network grant will NOT persist across rebuilds."
+    local stage_root staged_bundle
+    echo "==> Bundling Auto.app with stable Developer ID identity..."
+    stage_root="$(mktemp -d "$OUTPUT_DIR/.auto-bundle-stage.XXXXXX")"
+    staged_bundle="$stage_root/Auto.app"
+    if ! mkdir -p "$staged_bundle/Contents/MacOS" "$staged_bundle/Contents/Resources" \
+        || ! cp "$BIN_DIR/auto" "$staged_bundle/Contents/MacOS/auto" \
+        || ! cp "$SRC_DIR/cmd/auto/bundle/Info.plist" "$staged_bundle/Contents/Info.plist"; then
+        rm -rf "$stage_root"
+        echo "FAIL: could not assemble staged Auto.app" >&2
+        return 1
     fi
-    codesign --force --options runtime --identifier "$BUNDLE_ID" \
-        --sign "$id" "$APP_BUNDLE" 2>&1 | sed 's/^/    /'
+    if ! "$BIN_DIR/auto-sign" sign "$staged_bundle" \
+        || ! "$BIN_DIR/auto-sign" verify "$staged_bundle"; then
+        rm -rf "$stage_root"
+        echo "FAIL: staged Auto.app did not pass signing verification; existing bundle retained" >&2
+        return 1
+    fi
+    if ! publish_bundle "$staged_bundle" "$stage_root"; then
+        return 1
+    fi
+    rm -rf "$stage_root"
     echo "    Bundled -> output/Auto.app"
-    codesign -dv "$APP_BUNDLE" 2>&1 \
-        | grep -E "Identifier|TeamIdentifier|Authority=Apple Development|Authority=Developer ID" \
-        | sed 's/^/    /' || true
+    echo "    Verified team 58MF5GATL7; identifier com.darrenoakey.auto"
+}
+
+# publish_bundle keeps the prior verified bundle recoverable until the staged
+# bundle has been renamed into place on the same filesystem.
+publish_bundle() {
+    local staged_bundle="$1" stage_root="$2" backup="$2/previous.app" publish_status had_backup=0
+    if [ -e "$APP_BUNDLE" ] || [ -L "$APP_BUNDLE" ]; then
+        if ! mv -fh "$APP_BUNDLE" "$backup"; then
+            echo "FAIL: could not preserve existing Auto.app before publication" >&2
+            rm -rf "$stage_root"
+            return 1
+        fi
+        had_backup=1
+    fi
+    if mv -fh "$staged_bundle" "$APP_BUNDLE"; then
+        return 0
+    else
+        publish_status=$?
+    fi
+    if [ "$had_backup" -eq 1 ]; then
+        if ! mv -fh "$backup" "$APP_BUNDLE"; then
+            echo "FAIL: publishing Auto.app failed and restoring the prior bundle also failed; prior bundle retained at $backup" >&2
+            return "$publish_status"
+        fi
+        rm -rf "$stage_root"
+        echo "FAIL: publishing verified Auto.app failed; prior bundle restored" >&2
+        return "$publish_status"
+    fi
+    rm -rf "$stage_root"
+    echo "FAIL: publishing verified Auto.app failed; no existing bundle was changed" >&2
+    return "$publish_status"
 }
 
 cmd_test() {
@@ -172,7 +191,7 @@ cmd_health() {
         echo "FAIL: health must run from canonical checkout $CANONICAL_DIR" >&2
         return 1
     }
-    codesign --verify --deep --strict "$APP_BUNDLE"
+    "$BIN_DIR/auto-sign" verify "$APP_BUNDLE"
     pid="$(watcher_pid)" || {
         echo "FAIL: LaunchAgent watcher is not running" >&2
         return 1

@@ -7,6 +7,7 @@
 package install
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,12 +15,15 @@ import (
 	"time"
 
 	"auto/pkg/manager"
+	"auto/pkg/signing"
 )
 
 // daemonPATH is the PATH given to the watch daemon and every process it spawns.
 // It is fixed (not read from the environment) so behaviour does not depend on
 // whoever ran the installer.
 const daemonPATH = "/Users/darrenoakey/.local/bin:/Users/darrenoakey/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+const signingVerificationTimeout = 2 * time.Minute
 
 // AppExePath returns the path to the signed app binary inside the project tree.
 func AppExePath(root string) string {
@@ -29,9 +33,9 @@ func AppExePath(root string) string {
 // Install writes the wrapper and LaunchAgent and (re)loads the daemon. The app
 // bundle must already be built and signed (see `run build`).
 func Install(root string) error {
-	appExe := AppExePath(root)
-	if _, err := os.Stat(appExe); err != nil {
-		return fmt.Errorf("signed app binary missing at %s (run `run build` first): %w", appExe, err)
+	appExe, err := verifiedAppExecutable(root)
+	if err != nil {
+		return err
 	}
 	if err := writeWrapper(appExe); err != nil {
 		return err
@@ -45,6 +49,15 @@ func Install(root string) error {
 	}
 	fmt.Println("Installed and loaded auto LaunchAgent (signed, Local Network capable).")
 	return nil
+}
+
+func verifiedAppExecutable(root string) (string, error) {
+	operationContext, cancel := context.WithTimeout(context.Background(), signingVerificationTimeout)
+	defer cancel()
+	if err := signing.VerifyBundle(operationContext, filepath.Join(root, "output", "Auto.app")); err != nil {
+		return "", fmt.Errorf("refuse to install unverified Auto.app: %w", err)
+	}
+	return AppExePath(root), nil
 }
 
 // writeWrapper installs ~/bin/auto as a thin exec into the signed app binary so

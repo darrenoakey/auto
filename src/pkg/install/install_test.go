@@ -1,12 +1,23 @@
 package install
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"auto/pkg/signing"
 )
+
+const installTestInfoPlist = `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>com.darrenoakey.auto</string>
+<key>CFBundleExecutable</key><string>auto</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+</dict></plist>
+`
 
 func TestAppExePath(t *testing.T) {
 	got := AppExePath("/Users/x/local/auto")
@@ -57,8 +68,81 @@ func TestWriteWrapperExecsAppBinary(t *testing.T) {
 }
 
 func TestInstallFailsWithoutSignedBinary(t *testing.T) {
-	// Root with no built app: Install must refuse rather than bootstrap nothing.
-	if err := Install(t.TempDir()); err == nil {
-		t.Fatal("Install should fail when the signed binary is missing")
+	if _, err := verifiedAppExecutable(t.TempDir()); err == nil {
+		t.Fatal("installation verification should fail when the signed binary is missing")
+	}
+}
+
+func TestInstallRejectsUnsignedBundleBeforeFilesystemSideEffects(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := t.TempDir()
+	appExe := AppExePath(root)
+	if err := os.MkdirAll(filepath.Dir(appExe), 0o755); err != nil {
+		t.Fatalf("create unsigned bundle: %v", err)
+	}
+	if err := os.WriteFile(appExe, []byte("unsigned"), 0o755); err != nil {
+		t.Fatalf("write unsigned executable: %v", err)
+	}
+	if _, err := verifiedAppExecutable(root); err == nil {
+		t.Fatal("installation verification accepted an unsigned bundle")
+	}
+	if _, err := os.Stat(filepath.Join(home, "bin", "auto")); !os.IsNotExist(err) {
+		t.Fatalf("failed verification changed wrapper state: %v", err)
+	}
+}
+
+func TestInstallRejectsTamperedSignedBundleBeforeFilesystemSideEffects(t *testing.T) {
+	root := t.TempDir()
+	buildSignedInstallTestBundle(t, root)
+	appExe := AppExePath(root)
+	executable, err := os.OpenFile(appExe, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open signed executable: %v", err)
+	}
+	value := []byte{0}
+	if _, err = executable.ReadAt(value, 4096); err != nil {
+		_ = executable.Close()
+		t.Fatalf("read signed executable byte: %v", err)
+	}
+	value[0] ^= 0xff
+	if _, err = executable.WriteAt(value, 4096); err != nil {
+		_ = executable.Close()
+		t.Fatalf("tamper signed executable: %v", err)
+	}
+	if err = executable.Close(); err != nil {
+		t.Fatalf("close tampered executable: %v", err)
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if _, err := verifiedAppExecutable(root); err == nil {
+		t.Fatal("installation verification accepted a tampered signed bundle")
+	}
+	if _, err := os.Stat(filepath.Join(home, "bin", "auto")); !os.IsNotExist(err) {
+		t.Fatalf("failed verification changed wrapper state: %v", err)
+	}
+}
+
+func buildSignedInstallTestBundle(t *testing.T, root string) {
+	t.Helper()
+	executablePath := AppExePath(root)
+	if err := os.MkdirAll(filepath.Dir(executablePath), 0o755); err != nil {
+		t.Fatalf("create signed test bundle: %v", err)
+	}
+	moduleRoot, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatalf("resolve module root: %v", err)
+	}
+	command := exec.Command("go", "build", "-ldflags", "-s -w", "-o", executablePath, "./pkg/signing/testdata/minimal")
+	command.Dir = moduleRoot
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("build real Mach-O: %v: %s", err, output)
+	}
+	infoPath := filepath.Join(root, "output", "Auto.app", "Contents", "Info.plist")
+	if err := os.WriteFile(infoPath, []byte(installTestInfoPlist), 0o644); err != nil {
+		t.Fatalf("write test Info.plist: %v", err)
+	}
+	if err := signing.SignBundle(context.Background(), filepath.Dir(filepath.Dir(filepath.Dir(executablePath)))); err != nil {
+		t.Fatalf("sign real install test bundle: %v", err)
 	}
 }
