@@ -60,8 +60,9 @@ func verifiedAppExecutable(root string) (string, error) {
 	return AppExePath(root), nil
 }
 
-// writeWrapper installs ~/bin/auto as a thin exec into the signed app binary so
-// CLI invocations run the same signed identity.
+// writeWrapper installs ~/bin/auto (and ~/.local/bin/auto if ~/.local/bin exists)
+// as a thin exec into the signed app binary so CLI invocations run the same signed
+// identity without following or truncating symlinks.
 func writeWrapper(appExe string) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -73,10 +74,20 @@ func writeWrapper(appExe string) error {
 	}
 	content := fmt.Sprintf("#!/bin/bash\nexec %q \"$@\"\n", appExe)
 	wrapper := filepath.Join(binDir, "auto")
+	_ = os.Remove(wrapper)
 	if err := os.WriteFile(wrapper, []byte(content), 0o755); err != nil {
 		return err
 	}
 	fmt.Printf("Created %s\n", wrapper)
+	localBinDir := filepath.Join(home, ".local", "bin")
+	if info, err := os.Stat(localBinDir); err == nil && info.IsDir() {
+		localWrapper := filepath.Join(localBinDir, "auto")
+		_ = os.Remove(localWrapper)
+		if err := os.WriteFile(localWrapper, []byte(content), 0o755); err != nil {
+			return err
+		}
+		fmt.Printf("Created %s\n", localWrapper)
+	}
 	return nil
 }
 

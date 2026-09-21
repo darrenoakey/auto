@@ -58,6 +58,13 @@ func TestStableDesignatedRequirementRejectsCertificateHashIdentity(t *testing.T)
 	}
 }
 
+func TestVerifyAppleCodesignRejectsUnsignedBundle(t *testing.T) {
+	bundlePath := buildTestBundle(t)
+	if err := verifyAppleCodesign(context.Background(), bundlePath); err == nil {
+		t.Fatal("verifyAppleCodesign must fail on an unsigned bundle")
+	}
+}
+
 func TestBundleSigningFailurePreservesExistingBundle(t *testing.T) {
 	repositoryRoot, err := filepath.Abs("../../..")
 	if err != nil {

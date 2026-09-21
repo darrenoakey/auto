@@ -27,7 +27,10 @@ const (
 	executableName     = "auto"
 	rcodesignPath      = "/Users/darrenoakey/.cargo/bin/rcodesign"
 	plutilPath         = "/usr/bin/plutil"
+	codesignPath       = "/usr/bin/codesign"
 )
+
+const expectedDesignatedRequirement = `=identifier "` + expectedBundleId + `" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = "` + expectedTeamId + `"`
 
 type secretReference struct {
 	service string
@@ -178,7 +181,20 @@ func verify(context context.Context, bundlePath string) error {
 	if err != nil {
 		return fmt.Errorf("inspect Auto Mach-O signature: %w", err)
 	}
-	return verifySignatureInfo(output)
+	if err := verifySignatureInfo(output); err != nil {
+		return err
+	}
+	return verifyAppleCodesign(context, bundlePath)
+}
+
+func verifyAppleCodesign(context context.Context, bundlePath string) error {
+	if _, err := runProcess(context, codesignPath, []string{"--verify", "--deep", "--strict", bundlePath}); err != nil {
+		return fmt.Errorf("apple codesign verify Auto.app: %w", err)
+	}
+	if _, err := runProcess(context, codesignPath, []string{"-v", "-R", expectedDesignatedRequirement, bundlePath}); err != nil {
+		return fmt.Errorf("apple codesign designated requirement check failed: %w", err)
+	}
+	return nil
 }
 
 func verifyBundleMetadata(context context.Context, bundlePath string) error {

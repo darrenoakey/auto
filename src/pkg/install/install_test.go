@@ -67,6 +67,35 @@ func TestWriteWrapperExecsAppBinary(t *testing.T) {
 	}
 }
 
+func TestWriteWrapperUnlinksExistingSymlinkWithoutTruncatingTarget(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	appExe := filepath.Join(t.TempDir(), "target-auto")
+	originalContent := []byte("precious-signed-binary-content")
+	if err := os.WriteFile(appExe, originalContent, 0o755); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	binDir := filepath.Join(home, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	wrapper := filepath.Join(binDir, "auto")
+	if err := os.Symlink(appExe, wrapper); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if err := writeWrapper(appExe); err != nil {
+		t.Fatalf("writeWrapper: %v", err)
+	}
+	targetData, err := os.ReadFile(appExe)
+	if err != nil || string(targetData) != string(originalContent) {
+		t.Fatalf("writeWrapper corrupted/truncated symlink target: %q", string(targetData))
+	}
+	wrapperData, err := os.ReadFile(wrapper)
+	if err != nil || !strings.Contains(string(wrapperData), "exec \""+appExe+"\"") {
+		t.Fatalf("wrapper content incorrect: %s", wrapperData)
+	}
+}
+
 func TestInstallFailsWithoutSignedBinary(t *testing.T) {
 	if _, err := verifiedAppExecutable(t.TempDir()); err == nil {
 		t.Fatal("installation verification should fail when the signed binary is missing")
