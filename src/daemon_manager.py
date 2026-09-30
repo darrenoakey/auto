@@ -578,6 +578,15 @@ def stop_process(name: str, mark_explicit: bool = True) -> None:
     if pid is None:
         raise RuntimeError(f"Process {name} is not running")
 
+    if mark_explicit:
+        state = load_state()
+        if name in state:
+            if isinstance(state[name], int):
+                state[name] = {"pid": state[name], "explicitly_stopped": True}
+            else:
+                state[name]["explicitly_stopped"] = True
+            save_state(state)
+
     try:
         # kill the entire process group since we start with start_new_session=True
         # this ensures child processes (like uvicorn reloader/worker) are also terminated
@@ -604,16 +613,6 @@ def stop_process(name: str, mark_explicit: bool = True) -> None:
     port = config.get(name, {}).get("port")
     if port is not None and not is_port_free(port):
         force_free_port(port)
-
-    if mark_explicit:
-        # mark as explicitly stopped
-        state = load_state()
-        if name in state:
-            if isinstance(state[name], int):
-                state[name] = {"pid": state[name], "explicitly_stopped": True}
-            else:
-                state[name]["explicitly_stopped"] = True
-            save_state(state)
 
 
 # ##################################################################

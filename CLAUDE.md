@@ -127,3 +127,17 @@ The auto watch daemon runs as a LaunchAgent with `KeepAlive=true`. To restart it
 - `launchctl kickstart -k "gui/$(id -u)/com.darrenoakey.auto"` — kills and restarts the watch loop
 - Or `./run install` — reinstalls the plist and reloads the LaunchAgent
 - Managed processes are untouched because only the watch loop is restarted
+
+## Code Signing (permissions survive updates)
+
+macOS TCC (Full Disk Access, Accessibility, ...) keys grants on a binary's code-signing *designated requirement*. The LaunchAgent used to run Homebrew python directly; python is ad-hoc signed with a hash-based identity that changes on every brew upgrade, so every upgrade silently lost the grants.
+
+Now launchd runs `local/bin/auto-daemon` — a tiny C launcher (`launcher/auto_daemon.c`) that spawns `python3.13 run watch`, forwards signals and mirrors the exit status. `auto install` builds it and signs it with a persistent self-signed certificate kept in `local/signing.keychain-db` (password in daz-secrets `auto/signing-keychain-password`, only ever passed over stdin). The requirement is always:
+
+    identifier "com.darrenoakey.auto-daemon" and certificate root = H"<cert sha1>"
+
+so any rebuild of auto or python keeps the same identity. `auto signing` reports the status. Grant permissions to `~/src/auto/local/bin/auto-daemon`, never to python.
+
+`install` refuses to replace the launcher if the requirement would change (grants would be lost). It reloads the daemon via `local/daemon-handover`: the old watch loop sees the marker on SIGTERM and exits without shutting down managed processes. Never delete `local/signing.keychain-db` — a new certificate is a new identity and every grant must be re-approved.
+
+Tests: `.venv/bin/python -m pytest src` (venv on Homebrew python 3.13; system python 3.9 cannot import the sources).

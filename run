@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 import daemon_manager as dm
 import installer
+import signing
 
 class ShutdownRequested(Exception):
     pass
@@ -288,6 +289,10 @@ def command_watch(args: argparse.Namespace) -> int:
         raise ShutdownRequested()
 
     signal.signal(signal.SIGTERM, handle_sigterm)
+    # a marker left over from an interrupted install must not turn the next
+    # real shutdown into a silent handover
+    marker = installer.handover_marker_path()
+    marker.unlink(missing_ok=True)
     print("Watching processes for automatic restart...")
     try:
         while True:
@@ -297,6 +302,10 @@ def command_watch(args: argparse.Namespace) -> int:
         print("\nStopped watching")
         return 0
     except ShutdownRequested:
+        if marker.exists():
+            # `auto install` is replacing this daemon: leave the services running
+            print("\nSIGTERM received during daemon handover, leaving processes running")
+            return 0
         print("\nSIGTERM received, shutting down all processes...")
         dm.shutdown_all_processes()
         print("Shutdown complete")
@@ -331,6 +340,14 @@ def command_install(args: argparse.Namespace) -> int:
     except Exception as err:
         print(f"Error: {err}")
         return 1
+
+
+# ##################################################################
+# command signing
+# reports the launcher's code signature and whether it is stable
+def command_signing(args: argparse.Namespace) -> int:
+    print(signing.signing_status())
+    return 0
 
 
 # ##################################################################
@@ -424,6 +441,10 @@ def main(argv: list[str]) -> int:
     # install command
     install_parser = subparsers.add_parser("install", help="Install auto daemon and wrapper script")
     install_parser.set_defaults(func=command_install)
+
+    # signing command
+    signing_parser = subparsers.add_parser("signing", help="Show the daemon launcher's code signature status")
+    signing_parser.set_defaults(func=command_signing)
 
     args = parser.parse_args(argv)
     # suppress banner when invoked by AI agents or with -q; show with --banner

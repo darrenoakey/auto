@@ -183,3 +183,7 @@ rm -rf /path/to/auto
 ## License
 
 This project is licensed under [CC BY-NC 4.0](https://darren-static.waft.dev/license) - free to use and modify, but no commercial use without permission.
+
+## Permissions survive updates
+
+launchd runs a small code-signed launcher (`local/bin/auto-daemon`) rather than python directly. `auto install` signs it with a persistent local certificate so its code identity never changes; macOS permissions granted to it (Full Disk Access, Accessibility, ...) persist across updates of auto and python. Check with `auto signing`.
