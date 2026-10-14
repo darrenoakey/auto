@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"fmt"
 	"syscall"
 	"testing"
 )
@@ -53,6 +54,58 @@ func TestRestartDeadSkipsExplicitlyStopped(t *testing.T) {
 	}
 	if _, ok := results["live"]; !ok {
 		t.Fatalf("dead process should be restarted, got %v", results)
+	}
+}
+
+// BenchmarkWatchTickIdleRegistry measures real state-file supervision without
+// spawning services: explicitly stopped registrations must stay cheap at scale.
+func BenchmarkWatchTickIdleRegistry(b *testing.B) {
+	for _, count := range []int{1, 50, 150} {
+		b.Run(fmt.Sprint(count), func(b *testing.B) {
+			m := New(b.TempDir())
+			b.Cleanup(m.WaitForLogArchive)
+			seedIdleRegistry(m, count)
+			m.WatchTick()
+			m.WaitForLogArchive()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				m.WatchTick()
+			}
+		})
+	}
+}
+
+func seedIdleRegistry(m *Manager, count int) {
+	m.withState(func(data *stateFile) bool {
+		for i := 0; i < count; i++ {
+			data.Processes[fmt.Sprintf("stopped-%03d", i)] = &Process{
+				Command: "sleep 300", Workdir: m.Root(), ExplicitlyStopped: true,
+			}
+		}
+		return true
+	})
+}
+
+func TestWatchTickIdleRegistryOnlyWritesHeartbeat(t *testing.T) {
+	m := newTestManager(t)
+	seedIdleRegistry(m, 150)
+	before := m.stateCacheGen
+	m.WatchTick()
+	if writes := m.stateCacheGen - before; writes != 1 {
+		t.Fatalf("idle tick rewrote the entire registry %d times; want only heartbeat", writes)
+	}
+}
+
+func TestWatchTickIdleRegistryAllocationBudget(t *testing.T) {
+	m := newTestManager(t)
+	seedIdleRegistry(m, 150)
+	m.WatchTick()
+	m.WaitForLogArchive()
+	// The real disk-backed tick uses about 3,400 allocations. Whole-registry
+	// parsing per service used 156,000; retain headroom without hiding that bug.
+	if allocations := testing.AllocsPerRun(3, m.WatchTick); allocations > 10000 {
+		t.Fatalf("idle tick allocated %.0f times; must not parse the registry per service", allocations)
 	}
 }
 

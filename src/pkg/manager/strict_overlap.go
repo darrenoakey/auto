@@ -231,6 +231,12 @@ func strictOverlapRequestClaimable(process *Process) bool {
 
 // fulfillStrictOverlapSpawnRequest handles one watcher-owned strict request.
 func (m *Manager) fulfillStrictOverlapSpawnRequest(name string) bool {
+	// The common case has no request. Avoid locked whole-registry reads and
+	// cleanup writes for every service on every tick. definition observes
+	// external CLI writes; claimStrictOverlapRequest still rechecks under lock.
+	if process, ok := m.definition(name); !ok || process.StrictOverlapRequestId == "" {
+		return false
+	}
 	definition, requestId, claimed := m.claimStrictOverlapRequest(name)
 	if !claimed {
 		m.retryStrictOverlapCleanup(name)
@@ -362,10 +368,13 @@ func (m *Manager) retryStrictOverlapCleanup(name string) {
 }
 
 func (m *Manager) discardExpiredStrictOverlapRequest(name string) {
-	m.mutateProcess(name, func(process *Process) {
-		if process.StrictOverlapRequestId != "" && !strictOverlapRequestPending(process) {
-			clearStrictOverlapFields(process)
+	m.withState(func(data *stateFile) bool {
+		process, ok := data.Processes[name]
+		if !ok || process.StrictOverlapRequestId == "" || strictOverlapRequestPending(process) {
+			return false
 		}
+		clearStrictOverlapFields(process)
+		return true
 	})
 }
 

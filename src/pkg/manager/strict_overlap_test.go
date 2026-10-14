@@ -20,6 +20,111 @@ func cleanupManagedProcess(t *testing.T, manager *Manager, name string) {
 	})
 }
 
+func TestIdleStrictOverlapLeavesRegistryAndBackupUntouched(t *testing.T) {
+	m := newTestManager(t)
+	seedIdleRegistry(m, 150)
+	m.recordHeartbeat()
+	paths := []string{m.statePath(), backupPath(m.statePath())}
+	before := strictOverlapFileStats(t, paths)
+	cached := m.loadStateFile()
+	for _, name := range m.definedNames() {
+		if m.fulfillStrictOverlapSpawnRequest(name) {
+			t.Fatalf("unexpected spawn for stopped service %s", name)
+		}
+	}
+	after := strictOverlapFileStats(t, paths)
+	for i := range paths {
+		if !os.SameFile(before[i], after[i]) || !before[i].ModTime().Equal(after[i].ModTime()) {
+			t.Fatalf("idle strict overlap rewrote %s", paths[i])
+		}
+	}
+	if m.loadStateFile() != cached {
+		t.Fatal("idle strict overlap invalidated the parsed registry cache")
+	}
+}
+
+func strictOverlapFileStats(t *testing.T, paths []string) []os.FileInfo {
+	t.Helper()
+	var stats []os.FileInfo
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stats = append(stats, info)
+	}
+	return stats
+}
+
+func TestStrictOverlapExpiryRechecksExternalStateAndOnlyWritesChanges(t *testing.T) {
+	for _, state := range []string{"absent", "live", "claimed", "candidate", "result", "error", "expired", "removed"} {
+		t.Run(state, func(t *testing.T) { verifyStrictOverlapExpiry(t, state) })
+	}
+}
+
+func verifyStrictOverlapExpiry(t *testing.T, state string) {
+	t.Helper()
+	m := newTestManager(t)
+	mustAdd(t, m, "svc", "sleep 300", nil)
+	m.loadStateFile() // warm a no-request snapshot before another CLI writes
+	external := New(m.Root())
+	external.withState(func(data *stateFile) bool {
+		setExpiryTestState(data.Processes["svc"], state)
+		if state == "removed" {
+			delete(data.Processes, "svc")
+		}
+		return true
+	})
+	before := m.stateCacheGen
+	m.discardExpiredStrictOverlapRequest("svc")
+	wantWrites := int64(0)
+	if state == "expired" {
+		wantWrites = 1
+	}
+	if writes := m.stateCacheGen - before; writes != wantWrites {
+		t.Fatalf("%s: got %d writes, want %d", state, writes, wantWrites)
+	}
+	verifyExpiryStoredState(t, m, state)
+}
+
+func setExpiryTestState(p *Process, state string) {
+	if state == "absent" || state == "removed" {
+		return
+	}
+	now, deadline := nowUnix(), nowUnix()-1
+	p.StrictOverlapRequestId, p.StrictOverlapRequestedAt, p.StrictOverlapDeadline = state, &now, &deadline
+	switch state {
+	case "live":
+		deadline += 60
+	case "claimed":
+		p.StrictOverlapClaimed = true
+	case "candidate":
+		p.StrictOverlapCandidatePid = intPtr(os.Getpid())
+	case "result":
+		p.StrictOverlapResultPid = intPtr(os.Getpid())
+	case "error":
+		p.StrictOverlapError = "replacement failed"
+	}
+}
+
+func verifyExpiryStoredState(t *testing.T, m *Manager, state string) {
+	t.Helper()
+	p, ok := m.definition("svc")
+	if state == "removed" {
+		if ok {
+			t.Fatal("removed service was resurrected")
+		}
+		return
+	}
+	want := state
+	if state == "absent" || state == "expired" {
+		want = ""
+	}
+	if !ok || p.StrictOverlapRequestId != want {
+		t.Fatalf("%s request was lost or not cleared: %+v", state, p)
+	}
+}
+
 func TestRestartProcessStrictOverlapBindFailurePreservesOldRuntime(t *testing.T) {
 	manager := newTestManager(t)
 	port := freePort(t)
@@ -284,6 +389,11 @@ func TestRestartProcessStrictOverlapDelegatesAndServesWithoutRefusal(t *testing.
 	oldPid := startHolder(t, manager, "tunnel", port, true)
 	cleanupManagedProcess(t, manager, "tunnel")
 	setHeartbeat(t, manager, os.Getpid()+654321, 0)
+	// A separate watcher must see a CLI request even after caching its absence.
+	watcher := New(manager.Root())
+	if watcher.fulfillStrictOverlapSpawnRequest("tunnel") {
+		t.Fatal("watcher spawned without a request")
+	}
 
 	type restartResult struct {
 		pid int
@@ -302,8 +412,8 @@ func TestRestartProcessStrictOverlapDelegatesAndServesWithoutRefusal(t *testing.
 	probes := make(chan connectionProbeResult, 1)
 	stopProbing := make(chan struct{})
 	go probeUntilStopped(port, stopProbing, probes)
-	if !manager.fulfillStrictOverlapSpawnRequest("tunnel") {
-		t.Fatal("watcher did not fulfill strict overlap request")
+	if !watcher.fulfillStrictOverlapSpawnRequest("tunnel") {
+		t.Fatal("watcher did not observe and fulfill external strict overlap request")
 	}
 	result := <-done
 	close(stopProbing)
