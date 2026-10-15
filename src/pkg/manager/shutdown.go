@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -72,7 +73,9 @@ func (m *Manager) shutdownIsolates() <-chan struct{} {
 	for _, name := range m.definedNames() {
 		if def, ok := m.definition(name); ok && def.Isolate {
 			workers.Go(func() {
-				if err := m.isolateStop(name); err != nil {
+				operationContext, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+				defer cancel()
+				if err := m.isolateStopContext(operationContext, name); err != nil {
 					fmt.Printf("Warning: failed to unload isolated service %s: %v\n", name, err)
 				}
 			})

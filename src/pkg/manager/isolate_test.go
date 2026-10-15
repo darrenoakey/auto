@@ -1,6 +1,8 @@
 package manager
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -163,5 +165,14 @@ func TestRemoveProcessIsolateArtifacts(t *testing.T) {
 	}
 	if _, ok := m.definition("svc"); ok {
 		t.Fatal("svc should be removed from config")
+	}
+}
+
+func TestIsolateStopHonorsCancelledShutdownBudget(t *testing.T) {
+	m := newTestManager(t)
+	operationContext, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := m.isolateStopContext(operationContext, "auto-cancelled-shutdown-probe"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled shutdown query = %v, want context.Canceled", err)
 	}
 }

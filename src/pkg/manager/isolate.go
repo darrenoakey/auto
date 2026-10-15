@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -270,11 +271,23 @@ func isolateGUIDomain() string {
 // relies on launchd's own teardown — it already waits for the job to exit
 // before `bootout` returns.
 func (m *Manager) isolateStop(name string) error {
-	if !isolateBootstrapped(name) {
+	return m.isolateStopContext(context.Background(), name)
+}
+
+// isolateStopContext bounds launchctl during watcher teardown; launchd retains
+// responsibility for its unloaded job's TERM/KILL sequence if the client exits.
+func (m *Manager) isolateStopContext(operationContext context.Context, name string) error {
+	if err := exec.CommandContext(operationContext, "launchctl", "list", isolateLabel(name)).Run(); err != nil {
+		if operationContext.Err() != nil {
+			return fmt.Errorf("query isolated service %s: %w", name, operationContext.Err())
+		}
 		return nil
 	}
 	target := isolateGUITarget(isolateLabel(name))
-	if out, err := exec.Command("launchctl", "bootout", target).CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(operationContext, "launchctl", "bootout", target).CombinedOutput(); err != nil {
+		if operationContext.Err() != nil {
+			return fmt.Errorf("unload isolated service %s: %w", name, operationContext.Err())
+		}
 		// "no such process" (already gone) is not a failure.
 		if !strings.Contains(string(out), "Could not find") && !strings.Contains(string(out), "No such process") {
 			return fmt.Errorf("launchctl bootout %s: %v: %s", name, err, out)

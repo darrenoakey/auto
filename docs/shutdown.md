@@ -17,7 +17,10 @@ for the current boot and changes kernel power-management behavior.
   A child that ignores SIGTERM is still killed if its group leader exits first.
 - Isolated LaunchAgent jobs are unloaded, including registered jobs between
   launches. Signalling their PIDs alone would allow launchd KeepAlive to restart
-  them. Their plists remain for the next login.
+  them. Their plists remain for the next login. Shutdown-only launchctl clients
+  have an eight-second deadline, concurrent with direct cleanup, so a stuck
+  isolate bootout cannot consume the watcher's own launchd termination budget.
+  Launchd owns the unloaded job's final TERM/KILL sequence.
 - The watcher parks after cleanup until launchd terminates it. It does not exit
   into KeepAlive while launchd could still relaunch it. A new watcher or CLI in
   the same boot sees the same kernel flag and refuses launches.
