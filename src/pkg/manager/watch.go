@@ -15,10 +15,16 @@ import (
 // does not fire every spawn in a single instant; a fulfilled spawn request
 // counts toward the same per-tick cap since it performs an identical spawn.
 func (m *Manager) WatchTick() {
+	if m.checkStartsAllowed() != nil {
+		return
+	}
 	m.recordHeartbeat()
 	m.maybeArchiveOldLogs()
 	restarts := 0
 	for _, name := range m.definedNames() {
+		if m.checkStartsAllowed() != nil {
+			return
+		}
 		if def, ok := m.definition(name); ok && def.Isolate {
 			continue
 		}

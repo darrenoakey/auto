@@ -110,13 +110,17 @@ both plain log and zip recovers by dropping the plain file when the zip is good.
 Legacy timestamped logs (pre-daily-roll) are archived by mtime before today.
 
 ### Shutdown vs reload
-- System shutdown sends SIGTERM → the watch loop tears down all managed processes
-  cleanly (NOT marked explicitly stopped → they restart next boot).
-- `launchctl bootout` also SIGTERMs the daemon → same clean teardown; install uses
-  bootout+bootstrap. (`kickstart -k` SIGKILLs the whole job tree, killing the
-  managed services anyway, so it offers nothing better.)
-- Either way the fresh daemon restarts everything; managed services briefly drop
-  during a daemon reinstall. This is inherent to the launchd-job model.
+- `kern.willshutdown` identifies committed machine shutdown/restart. The watcher
+  checks before supervision and launches, inhibits starts before draining active
+  spawn accounting, stops process groups, and parks until launchd terminates it.
+  A relaunched watcher sees the same boot-scoped kernel flag and cannot respawn.
+- SIGTERM immediately inhibits launches independently of the busy watch loop,
+  then tears down managed services. Manual `launchctl bootout` also sends SIGTERM;
+  the signal alone is not labelled machine shutdown. SIGINT leaves services up.
+- Isolated KeepAlive jobs are unloaded during teardown, not merely signalled.
+  Definitions and operator explicit-stop preferences survive for the next login.
+- Reload/install still stops services; production `./run deploy` instead replaces
+  only the watcher. See `docs/shutdown.md` for sources, tests and ordering limits.
 
 ## Gotchas
 

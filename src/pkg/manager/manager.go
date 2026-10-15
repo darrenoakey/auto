@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -65,6 +66,11 @@ var addressInUseMarkers = []string{
 // All operations are methods so tests can run against a temporary root.
 type Manager struct {
 	root string
+
+	// stopping is set before signal delivery reaches the busy watch loop.
+	// startMu drains already-started children through ownership recording.
+	stopping atomic.Bool
+	startMu  sync.RWMutex
 
 	// logArchiveMu guards the log-archive pass scheduling state below.
 	// logArchiveBusy prevents overlapping passes; logArchiveLast and

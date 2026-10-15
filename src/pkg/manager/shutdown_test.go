@@ -1,8 +1,11 @@
 package manager
 
 import (
+	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestShutdownAllKillsRunning(t *testing.T) {
@@ -55,5 +58,38 @@ func TestLaunchAgentPathSuffix(t *testing.T) {
 func TestAutoDaemonPidNonNegative(t *testing.T) {
 	if AutoDaemonPid() < 0 {
 		t.Fatal("AutoDaemonPid should never be negative")
+	}
+}
+
+func TestShutdownUnloadsIsolatedKeepAliveJob(t *testing.T) {
+	m := newTestManager(t)
+	name := fmt.Sprintf("auto-shutdown-test-%d-%d", os.Getpid(), time.Now().UnixNano())
+	startShutdownTestIsolate(t, m, name)
+	m.StopAllForRespawn()
+	if !isolateBootstrapped(name) {
+		t.Fatal("stop-all unregistered isolated job")
+	}
+	m.InhibitStarts()
+	m.ShutdownAll()
+	if isolateBootstrapped(name) {
+		t.Fatal("isolated KeepAlive job still registered after shutdown")
+	}
+	if m.isExplicitlyStopped(name) {
+		t.Fatal("shutdown persisted an operator stop")
+	}
+	if _, err := os.Stat(isolatePlistPath(name)); err != nil {
+		t.Fatalf("shutdown removed next-login plist: %v", err)
+	}
+}
+
+func startShutdownTestIsolate(t *testing.T, m *Manager, name string) {
+	t.Helper()
+	mustAdd(t, m, name, "/bin/sleep 300", nil)
+	if err := m.SetIsolate(name, true); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.isolateRemoveArtifacts(name) })
+	if _, err := m.StartProcess(name); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -296,11 +296,24 @@ auto ps
 | `show <name>` | Display the command and workdir for a process |
 | `log <name> [--tail] [--file]` | View process logs |
 | `start-all` | Start all configured processes |
-| `stop-all` | Stop all running processes (watch daemon respawns them) |
+| `stop-all` | Stop watcher-owned processes for respawn; isolated LaunchAgents stay running |
 | `restart-all` | Restart all dead, non-stopped processes |
 | `watch` | Monitor and restart crashed processes |
 | `shutdown` | Stop everything and the daemon for a clean reboot |
 | `install` | Build, sign, and load the daemon and wrapper script |
+
+## Automatic machine shutdown
+
+Auto detects committed macOS shutdown or restart using the native
+`kern.willshutdown` flag. It inhibits launches, gracefully stops managed process
+groups and unloads isolated KeepAlive jobs, then waits for launchd to terminate
+the watcher instead of restarting services. A watcher relaunched during the same
+shutdown also refuses starts. Eligible services resume at the next GUI login.
+
+SIGTERM separately stops supervision and services without treating an ordinary
+reload as proof of machine shutdown. Sleep and cancellable shutdown dialogs do
+not latch the machine-shutdown state. See [shutdown handling](docs/shutdown.md)
+for the fetched Apple/Stack Overflow evidence, regression tests, and timing limits.
 
 ## Uninstalling
 

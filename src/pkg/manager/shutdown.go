@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -27,7 +28,23 @@ type killTarget struct {
 // ShutdownAll stops all running managed processes in parallel without marking
 // them explicitly stopped, so they recover after the next boot.
 func (m *Manager) ShutdownAll() {
-	targets := m.runningTargets()
+	m.startMu.Lock()
+	defer m.startMu.Unlock()
+	isolatesDone := m.shutdownIsolates()
+	defer func() { <-isolatesDone }()
+	m.shutdownTargets(m.runningTargets())
+}
+
+// StopAllForRespawn stops only watcher-owned groups. Isolated jobs already have
+// their own launchd identity and must stay registered: the watcher deliberately
+// never supervises them. Unlike ShutdownAll, this is not a shutdown operation.
+func (m *Manager) StopAllForRespawn() {
+	m.startMu.Lock()
+	defer m.startMu.Unlock()
+	m.shutdownTargets(m.runningTargets())
+}
+
+func (m *Manager) shutdownTargets(targets []killTarget) {
 	if len(targets) == 0 {
 		return
 	}
@@ -46,10 +63,32 @@ func (m *Manager) ShutdownAll() {
 	}
 }
 
-// runningTargets collects all currently-running managed processes with pgids.
+// shutdownIsolates unloads even registered-but-dead jobs, not just live PIDs.
+// Sending their process groups SIGTERM would let launchd KeepAlive respawn them.
+// Plists and explicitly-stopped flags remain unchanged for the next login.
+func (m *Manager) shutdownIsolates() <-chan struct{} {
+	done := make(chan struct{})
+	var workers sync.WaitGroup
+	for _, name := range m.definedNames() {
+		if def, ok := m.definition(name); ok && def.Isolate {
+			workers.Go(func() {
+				if err := m.isolateStop(name); err != nil {
+					fmt.Printf("Warning: failed to unload isolated service %s: %v\n", name, err)
+				}
+			})
+		}
+	}
+	go func() { workers.Wait(); close(done) }()
+	return done
+}
+
+// runningTargets collects all currently-running directly managed processes.
 func (m *Manager) runningTargets() []killTarget {
 	var targets []killTarget
 	for _, name := range sortedNames(m.loadStateFile().Processes) {
+		if def, ok := m.definition(name); !ok || def.Isolate {
+			continue
+		}
 		pid, alive := m.processStatus(name)
 		if !alive {
 			continue
@@ -70,7 +109,7 @@ func waitForTargets(targets []killTarget, timeout time.Duration) []killTarget {
 		time.Sleep(100 * time.Millisecond)
 		remaining := alive[:0:0]
 		for _, t := range alive {
-			if isProcessAlive(t.pid) {
+			if processGroupAlive(t.pgid) {
 				remaining = append(remaining, t)
 			}
 		}
@@ -110,6 +149,7 @@ func LaunchAgentPath() string {
 // then obliterates all managed processes. Processes are not marked explicitly
 // stopped, so they restart after the next boot.
 func (m *Manager) ShutdownForReboot() {
+	m.InhibitStarts()
 	daemonPid := AutoDaemonPid()
 	plist := LaunchAgentPath()
 	if _, err := os.Stat(plist); err == nil {

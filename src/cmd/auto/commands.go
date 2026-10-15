@@ -186,8 +186,8 @@ func cmdStopAll(m *manager.Manager) int {
 			running = append(running, info.Name)
 		}
 	}
-	m.ShutdownAll()
-	fmt.Printf("Stopped %d running process(es); the watch daemon will respawn them\n", len(running))
+	m.StopAllForRespawn()
+	fmt.Printf("Stopped watcher-owned processes among %d running service(s); the watch daemon will respawn them; isolated jobs unchanged\n", len(running))
 	return 0
 }
 

@@ -13,6 +13,9 @@ import (
 // back to a serial restart. Any replacement failure leaves the old process
 // recorded and running; callers must use start separately when it is dead.
 func (m *Manager) RestartProcessStrictOverlap(name string) (int, error) {
+	if err := m.checkStartsAllowed(); err != nil {
+		return 0, err
+	}
 	definition, ok := m.definition(name)
 	if !ok {
 		return 0, fmt.Errorf("process %s not found in config", name)
@@ -237,6 +240,10 @@ func (m *Manager) fulfillStrictOverlapSpawnRequest(name string) bool {
 	if process, ok := m.definition(name); !ok || process.StrictOverlapRequestId == "" {
 		return false
 	}
+	if err := m.enterStart(); err != nil {
+		return false
+	}
+	defer m.startMu.RUnlock()
 	definition, requestId, claimed := m.claimStrictOverlapRequest(name)
 	if !claimed {
 		m.retryStrictOverlapCleanup(name)

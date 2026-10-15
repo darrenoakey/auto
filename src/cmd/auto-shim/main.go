@@ -21,13 +21,35 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/signal"
 	"syscall"
+
+	"auto/pkg/manager"
 )
+
+// mayExecService checks again in the launchd-owned shim, after bootstrap has
+// returned. If shutdown or an unreadable kernel state prevents exec, park until
+// termination rather than exit into the isolated job's KeepAlive restart loop.
+func mayExecService() bool {
+	shutdown, err := manager.SystemShutdownRequested()
+	if err == nil && !shutdown {
+		return true
+	}
+	fmt.Fprintf(os.Stderr, "auto-shim: service launch inhibited (shutdown=%v, error=%v)\n", shutdown, err)
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(signals)
+	<-signals
+	return false
+}
 
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: auto-shim <command>")
 		os.Exit(2)
+	}
+	if !mayExecService() {
+		return
 	}
 	command := os.Args[1]
 	argv := []string{"sh", "-c", "exec " + command}

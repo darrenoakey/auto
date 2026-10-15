@@ -34,6 +34,9 @@ var afterPortCheckHook func(port int)
 // StartProcess delegates; otherwise (daemon down, or this call IS the
 // daemon) it spawns directly as before.
 func (m *Manager) StartProcess(name string) (int, error) {
+	if err := m.checkStartsAllowed(); err != nil {
+		return 0, err
+	}
 	def, ok := m.definition(name)
 	if !ok {
 		return 0, fmt.Errorf("process %s not found in config", name)
@@ -82,6 +85,10 @@ func (m *Manager) spawnDirectWith(
 	def *Process,
 	spawn func(name, command, workdir string, port *int) (int, string, error),
 ) (int, error) {
+	if err := m.enterStart(); err != nil {
+		return 0, err
+	}
+	defer m.startMu.RUnlock()
 	// Claim the start before spawning: for the whole spawn window the entry
 	// still has Pid=nil, and a concurrent WatchTick reading that would start a
 	// competing copy (observed: `auto add` and the watch loop each spawning one
@@ -398,6 +405,9 @@ func ensurePortFree(port *int, name string) error {
 // marks the process explicitly stopped during the operation to block the watch
 // loop, clearing the flag if the start fails so the loop can recover.
 func (m *Manager) RestartProcess(name string) (int, error) {
+	if err := m.checkStartsAllowed(); err != nil {
+		return 0, err
+	}
 	def, ok := m.definition(name)
 	if !ok {
 		return 0, fmt.Errorf("process %s not found in config", name)
@@ -517,6 +527,9 @@ func (m *Manager) spawnReplacement(name string) (int, error) {
 // serial path, which converges as soon as the port is genuinely free.
 // Launchd-isolated processes have their own restart path and reject overlap.
 func (m *Manager) RestartProcessOverlap(name string) (int, error) {
+	if err := m.checkStartsAllowed(); err != nil {
+		return 0, err
+	}
 	def, ok := m.definition(name)
 	if !ok {
 		return 0, fmt.Errorf("process %s not found in config", name)

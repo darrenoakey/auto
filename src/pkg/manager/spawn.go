@@ -140,6 +140,9 @@ func refuseOccupiedPort(port *int, name string) error {
 }
 
 func (m *Manager) spawnOnce(name, wrapped, workdir string) (int, string, int64, error) {
+	if err := m.checkStartsAllowed(); err != nil {
+		return 0, "", 0, err
+	}
 	logPath := m.dailyLogPath(name)
 	offset := fileSize(logPath)
 	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
@@ -158,6 +161,9 @@ func (m *Manager) spawnOnce(name, wrapped, workdir string) (int, string, int64, 
 		cmd.Dir = workdir
 	} else {
 		cmd.Dir = "/"
+	}
+	if err := m.checkStartsAllowed(); err != nil {
+		return 0, "", 0, err
 	}
 	if err := cmd.Start(); err != nil {
 		return 0, "", 0, err

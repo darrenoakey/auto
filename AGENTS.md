@@ -43,3 +43,15 @@ Diagnose with `greenline status` and `greenline doctor` (`--fix` to reconcile).
   `go tool addr2line output/Auto.app/Contents/MacOS/auto`: replace the ASLR load
   address with the Mach-O `__TEXT` vmaddr from `otool -l`, retaining each frame's
   offset. Use the exact sampled binary before deploying its replacement.
+
+## Shutdown safety
+
+- Read `docs/shutdown.md` before changing shutdown or spawn paths. Never write
+  `kern.willshutdown` or simulate global shutdown notifications in a test.
+- Every actual launch must pass the kernel shutdown gate, including retries,
+  overlap candidates, isolate bootstrap/kickstart, and auto-shim exec. Keep spawn
+  ownership recording inside the start barrier so teardown cannot miss a child.
+- Inhibit starts before teardown, but preserve operator explicit-stop flags.
+  Unload isolated KeepAlive jobs instead of just signalling their process groups.
+- Kernel-confirmed shutdown parks the watcher until launchd terminates it;
+  SIGTERM alone also occurs during ordinary bootout and is not machine proof.

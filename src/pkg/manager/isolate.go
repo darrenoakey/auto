@@ -222,11 +222,18 @@ func (m *Manager) isolateRestart(name, command, workdir string) (int, error) {
 // launchd does not already know about it, or kickstarts (restarts) it if it
 // does.
 func (m *Manager) isolateLaunch(name, command, workdir string) error {
+	if err := m.enterStart(); err != nil {
+		return err
+	}
+	defer m.startMu.RUnlock()
 	plist, err := m.isolateWritePlist(name, command, workdir)
 	if err != nil {
 		return err
 	}
 	target := isolateGUITarget(isolateLabel(name))
+	if err := m.checkStartsAllowed(); err != nil {
+		return err
+	}
 	if isolateBootstrapped(name) {
 		if out, err := exec.Command("launchctl", "kickstart", "-k", target).CombinedOutput(); err != nil {
 			return fmt.Errorf("launchctl kickstart %s: %v: %s", name, err, out)
