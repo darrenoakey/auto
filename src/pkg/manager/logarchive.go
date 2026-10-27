@@ -91,9 +91,12 @@ func (m *Manager) WaitForLogArchive() {
 // archiveOldLogs zips up to limit eligible .log files under the log tree.
 // limit <= 0 means no budget (archive every eligible file). Returns how many
 // files were archived. Safe to call concurrently with process supervision:
-// today's active daily log is skipped by date.
+// today's active daily log is skipped by date, and a dated log that a live
+// managed process is still writing through is never archived (see
+// liveLogPaths).
 func (m *Manager) archiveOldLogs(limit int) int {
 	today := startOfLocalDay(time.Now())
+	held := m.liveLogPaths()
 	archived := 0
 	// Inspect the log tree WITHOUT creating it: logDir() is a creating getter
 	// (spawn paths rely on that), but this pass runs in a background goroutine
@@ -115,7 +118,7 @@ func (m *Manager) archiveOldLogs(limit int) int {
 		if !isPlainLogFile(path, entry) {
 			return nil
 		}
-		if path == m.daemonLogPath() {
+		if path == m.daemonLogPath() || held[path] {
 			return nil
 		}
 		if !shouldArchiveLog(path, today) {
@@ -129,6 +132,26 @@ func (m *Manager) archiveOldLogs(limit int) int {
 		return nil
 	})
 	return archived
+}
+
+// liveLogPaths is the set of log files still open as the stdout/stderr of a
+// live managed process. A service is handed its daily log file once, at spawn,
+// and writes through that descriptor for as long as it runs. Archiving that
+// file after midnight unlinked it under the running service: every later line
+// went to a deleted inode and a long-lived service (the dazup updater, the
+// desktop shell) silently stopped logging until its next restart. Such a log
+// keeps its spawn date in its name and is archived after the process exits.
+func (m *Manager) liveLogPaths() map[string]bool {
+	held := map[string]bool{}
+	for _, p := range m.loadStateFile().Processes {
+		if p == nil || p.Isolate || p.LogPath == "" || p.Pid == nil {
+			continue
+		}
+		if isOurProcess(*p.Pid, p.StartTime) {
+			held[p.LogPath] = true
+		}
+	}
+	return held
 }
 
 // daemonLogPath is the watch daemon's own stdout/stderr file, fixed by the

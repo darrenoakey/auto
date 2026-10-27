@@ -267,6 +267,7 @@ func (m *Manager) completeStrictOverlapCandidate(name, requestId string, pid int
 		return false
 	}
 	if startTime != "" && m.finalizeStrictOverlapCandidate(name, requestId, pid, startTime, logPath) {
+		m.registerChild(name, pid, logPath)
 		reapWhenDone(pid)
 		return true
 	}

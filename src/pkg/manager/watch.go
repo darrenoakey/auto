@@ -44,6 +44,9 @@ func (m *Manager) WatchTick() {
 			m.superviseRunning(name)
 			continue
 		}
+		if m.recoverOwnChild(name) {
+			continue
+		}
 		if restarts >= MaxRestartsPerWatchTick || !m.shouldRestart(name) {
 			continue
 		}

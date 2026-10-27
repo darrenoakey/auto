@@ -102,6 +102,7 @@ func (m *Manager) spawnDirectWith(
 		m.clearStartClaim(name)
 		return 0, err
 	}
+	m.registerChild(name, pid, logPath)
 	m.recordStarted(name, pid, logPath)
 	return pid, nil
 }

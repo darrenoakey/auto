@@ -392,3 +392,59 @@ func TestArchiveSkipsDaemonOwnLog(t *testing.T) {
 		t.Fatalf("an archived service log should be removed, stat err = %v", err)
 	}
 }
+
+// TestArchiveOldLogsKeepsALogALiveServiceIsStillWriting is the midnight
+// regression: a long-lived service writes through the daily log it was handed
+// at spawn. Archiving that file unlinked it under the running process, so every
+// later line went to a deleted inode and the service stopped logging until its
+// next restart. The held log must survive while the process lives, keep
+// receiving output, and be archived once the process is gone.
+func TestArchiveOldLogsKeepsALogALiveServiceIsStillWriting(t *testing.T) {
+	m := newTestManager(t)
+	mustAdd(t, m, "longlived", "/bin/sh -c 'while true; do echo tick; sleep 0.1; done'", nil)
+	if _, err := m.StartProcess("longlived"); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = m.StopProcess("longlived", true) })
+	held := m.loadStateFile().Processes["longlived"].LogPath
+	if held == "" {
+		t.Fatal("started service recorded no log path")
+	}
+	// The service was spawned "yesterday": its held log carries that date, as
+	// it does on a real host after midnight.
+	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+	dated := strings.Replace(held, time.Now().Format("2006-01-02"), yesterday, 1)
+	if err := os.MkdirAll(filepath.Dir(dated), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(held, dated); err != nil {
+		t.Fatal(err)
+	}
+	m.mutateProcess("longlived", func(p *Process) { p.LogPath = dated })
+	other := writeNamedLog(t, m, "finished", yesterday, "done\n")
+
+	if got := m.archiveOldLogs(0); got != 1 {
+		t.Fatalf("archiveOldLogs = %d, want only the finished service's log", got)
+	}
+	if _, err := os.Stat(other + ".zip"); err != nil {
+		t.Fatalf("finished service's old log not archived: %v", err)
+	}
+	before := fileSize(dated)
+	deadline := time.Now().Add(5 * time.Second)
+	for fileSize(dated) <= before {
+		if time.Now().After(deadline) {
+			t.Fatalf("live service stopped writing to its held log %s", dated)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if err := m.StopProcess("longlived", true); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if got := m.archiveOldLogs(0); got != 1 {
+		t.Fatalf("archiveOldLogs after exit = %d, want the released log archived", got)
+	}
+	if _, err := os.Stat(dated); !os.IsNotExist(err) {
+		t.Fatalf("released log should be archived, stat err=%v", err)
+	}
+}

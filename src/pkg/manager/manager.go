@@ -99,6 +99,11 @@ type Manager struct {
 	stateCacheSize     int64
 	stateCacheGen      int64 // bumped on every saveStateFile (own write)
 	stateCacheSavedGen int64 // gen of the disk content the cache reflects
+
+	// children registers every service child this process spawned (see
+	// children.go), so the watch daemon can recover one its record lost.
+	childrenMu sync.Mutex
+	children   map[int]ownChild
 }
 
 // New returns a Manager rooted at the given project directory.
