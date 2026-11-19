@@ -76,7 +76,7 @@ func (m *Manager) ownChildRecord(pid int) (ownChild, bool) {
 func (m *Manager) recoverOwnChild(name string) bool {
 	def, ok := m.definition(name)
 	if !ok || def.Isolate || startClaimIsLive(def) || def.SpawnRequestedAt != nil ||
-		def.OverlapSpawnRequestedAt != nil || def.StrictOverlapRequestId != "" {
+		def.OverlapSpawnRequestedAt != nil || def.StrictOverlapRequestId != "" || termStopHoldActive(def) {
 		return false
 	}
 	recorded := 0

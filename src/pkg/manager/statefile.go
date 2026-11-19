@@ -72,6 +72,37 @@ type Process struct {
 	StrictOverlapCandidateStartTime *string  `json:"strict_overlap_candidate_start_time,omitempty"`
 	StrictOverlapResultPid          *int     `json:"strict_overlap_result_pid,omitempty"`
 	StrictOverlapError              string   `json:"strict_overlap_error,omitempty"`
+	// TermStopRequestedAt marks an in-flight term-only restart (auto restart
+	// <name> --term-only): the old process has been asked — with exactly one
+	// SIGTERM to its process group — to terminate on its own, and the caller
+	// is waiting within TermStopRequestTTL before starting the replacement.
+	// While present (or after the timeout marker below) automatic supervision
+	// must not touch the service: a periodic restart or crash-restart would
+	// eventually SIGKILL the very process that was only asked politely to
+	// exit. TermStopOriginalPid/StartTime pin the exact instance the request
+	// targeted, so a timeout is recorded only for that instance. A timed-out
+	// marker (TermStopTimedOut) has NO TTL: it persists across daemon restarts
+	// and reboots until an operator resolves it, because resuming supervision
+	// would kill a process that explicitly declined to terminate. All fields
+	// are omitted from JSON when unset, so existing state files load unchanged.
+	TermStopRequestedAt       *float64 `json:"term_stop_requested_at,omitempty"`
+	TermStopOriginalPid       *int     `json:"term_stop_original_pid,omitempty"`
+	TermStopOriginalStartTime *string  `json:"term_stop_original_start_time,omitempty"`
+	TermStopTimedOut          bool     `json:"term_stop_timed_out,omitempty"`
+	// TermStopGeneration is the ownership epoch at request time. Every
+	// runtime-identity write on this entry (start, restart, adoption) bumps
+	// the epoch, so a term-only request can atomically verify — inside the
+	// exclusive state transaction that delivers its SIGTERM — that the exact
+	// instance it asked to terminate is still the supervised one. A recycled
+	// pid or a replacement that won a race carries a different epoch and the
+	// signal is never sent. Omitted when zero, so existing files load
+	// unchanged.
+	TermStopGeneration int64 `json:"term_stop_generation,omitempty"`
+	// TermStopRequestGeneration snapshots TermStopGeneration at request time.
+	// The SIGTERM is delivered from inside the exclusive state transaction only
+	// when the two still match: any ownership write since the request (start,
+	// stop, adoption) bumped the epoch, and the signal is withheld.
+	TermStopRequestGeneration int64 `json:"term_stop_request_generation,omitempty"`
 	// Isolate marks a process as launchd-managed instead of daemon-managed:
 	// StartProcess/StopProcess/RestartProcess/processStatus all delegate to
 	// isolate.go, which registers a dedicated per-process LaunchAgent
@@ -100,6 +131,14 @@ type stateFile struct {
 	// JSON when unset, so existing state files load unchanged.
 	DaemonHeartbeat *float64 `json:"daemon_heartbeat,omitempty"`
 	DaemonPid       *int     `json:"daemon_pid,omitempty"`
+	// DaemonFeatures is the feature bitmap of the daemon that wrote the
+	// current heartbeat (see Feature* constants). It is how a CLI invocation
+	// fails closed against an older watch daemon: if the live daemon does not
+	// advertise a feature, the CLI refuses to begin the operation that needs
+	// it. An old daemon never writes this field and drops a stale one from
+	// another daemon generation on its first heartbeat save, so the gate
+	// heals mechanically as watchers restart. Omitted when unset.
+	DaemonFeatures *int `json:"daemon_features,omitempty"`
 }
 
 // loadStateFresh reads the entire state file from disk, recovering from

@@ -40,6 +40,15 @@ func (m *Manager) WatchTick() {
 			restarts++
 			continue
 		}
+		// A term-only restart is in flight or has timed out on a live old
+		// process. Everything below (periodic restart, orphan adoption, crash
+		// restart) escalates to SIGKILL eventually; the hold keeps it off the
+		// process that was only ever asked politely to terminate. Deliberately
+		// placed AFTER the delegated-spawn fulfillment above: the term-only
+		// restart's own replacement start arrives as exactly such a request.
+		if def, ok := m.definition(name); ok && termStopHoldActive(def) {
+			continue
+		}
 		if _, alive := m.processStatus(name); alive {
 			m.superviseRunning(name)
 			continue
@@ -66,8 +75,17 @@ func (m *Manager) recordHeartbeat() {
 		pid := os.Getpid()
 		data.DaemonHeartbeat = &now
 		data.DaemonPid = &pid
+		features := daemonFeatureBits()
+		data.DaemonFeatures = &features
 		return true
 	})
+}
+
+// daemonFeatureBits is the capability bitmap this daemon advertises in every
+// heartbeat. The Feature* constants are additive; a daemon that predates one
+// simply does not set it, and CLI callers fail closed against it.
+func daemonFeatureBits() int {
+	return FeatureTermOnly
 }
 
 // fulfillOverlapSpawnRequest performs a pending delegated OVERLAP spawn
