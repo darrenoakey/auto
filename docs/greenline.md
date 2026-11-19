@@ -44,6 +44,28 @@ Under an exclusive lock (other submits queue behind it):
 5. **Deploy** — run `./run deploy` with cwd = the canonical checkout. Nonzero → **automatic rollback**: main resets to the previous commit and `./run deploy` re-runs to restore prod.
 6. **Publish** — push `main` to origin (via a one-shot allow-push flag the pre-push hook honours) and advance `last-green`.
 
+## Graceful-only watcher release
+
+For a release that must not force-stop the watcher or any managed service, use
+`greenline submit --graceful-only`. This requires a Greenline version that pins
+`tools/graceful-release` from the checked candidate for **both** activation and
+rollback. Do not substitute plain `submit`, `run deploy`, or `run install`.
+
+The driver stages the signed bundle at the tested SHA and retains the prior
+verified bundle on the same filesystem. It asks launchd to deliver a single
+SIGINT to the watcher. Auto handles SIGINT by leaving its services running;
+launchd KeepAlive starts the next watcher naturally. The driver verifies that
+the actual loaded executable is the expected image as well as checking health.
+It does not reinstall the LaunchAgent, update the isolate shim, or change
+service registration, access or credentials. This option is not for a release
+that requires changing those things.
+
+If the watcher does not retire in time, the driver does not escalate. Rollback
+restores the exact prior bundle. It never signals the prior watcher again; only
+a watcher proven to be running the rejected image can receive a rollback
+SIGINT. If even that watcher does not retire, recovery fails closed. Preserve
+the transaction state and do not follow up with a force-capable command.
+
 ## The contract (you must implement in `./run`)
 
 - **`./run check`** — cwd = the worktree being gated. Build + lint + FULL tests against a

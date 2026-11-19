@@ -1,0 +1,144 @@
+#!/bin/bash
+# Greenline pins this exact driver for both directions of a graceful transaction.
+set -euo pipefail
+
+fail() { echo "graceful release: $*" >&2; return 1; }
+
+watcher_pid() {
+    local details
+    details=$(/bin/launchctl print "$1" 2>/dev/null) || return 1
+    awk '/^[[:space:]]*pid = [0-9]+/{print $3; exit}' <<<"$details"
+}
+
+watcher_identity() {
+    local pid=$1 cmd started
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    cmd=$(/bin/ps -p "$pid" -o command=) || return 1
+    [[ "$cmd" == "$2" ]] || return 1
+    started=$(/bin/ps -p "$pid" -o lstart=) || return 1
+    [[ -n "$started" ]] || return 1
+    printf '%s %s\n' "$pid" "$started"
+}
+
+file_inode() { /usr/bin/stat -f '%i' "$1"; }
+
+watcher_has_image() {
+    local images
+    images=$(/usr/sbin/lsof -anP -p "$1" -d txt -Fi 2>/dev/null) || return 1
+    grep -qx "i$2" <<<"$images"
+}
+
+# KeepAlive starts the next watcher naturally. Never bootout, kickstart, send
+# TERM (Auto tears down all services on TERM), or signal a PID directly.
+interrupt_watcher() {
+    local target=$1 expected=$2 pid=$3 token=$4 evidence=$5 again
+    [[ ! -e "$evidence" ]] || { fail "already requested watcher retirement; not retrying"; return 1; }
+    again=$(watcher_pid "$target") && [[ "$again" == "$pid" ]] &&
+        [[ "$(watcher_identity "$pid" "$expected")" == "$token" ]] || {
+        fail "watcher ownership changed; no signal sent"; return 1;
+    }
+    printf '%s\n' "$token" > "$evidence" || return 1
+    /bin/launchctl kill SIGINT "$target"
+}
+
+await_image() {
+    local target=$1 expected=$2 desired=$3 attempts=$4 pid
+    while (( attempts > 0 )); do
+        pid=$(watcher_pid "$target") || pid=
+        if watcher_identity "$pid" "$expected" >/dev/null && watcher_has_image "$pid" "$desired"; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+        attempts=$((attempts - 1))
+        sleep 0.1
+    done
+    fail "watcher did not load the verified image within the grace window; no escalation"
+}
+
+stage_bundle() {
+    mkdir "$state/source" && git archive "$sha" | tar -xf - -C "$state/source" || return 1
+    "$state/source/run" build
+}
+
+activate_bundle() {
+    local pid token prior candidate staged
+    pid=$(watcher_pid "$target") && token=$(watcher_identity "$pid" "$expected") &&
+        prior=$(file_inode "$exe") && watcher_has_image "$pid" "$prior" || {
+        fail "no verifiable prior watcher; no activation attempted"; return 1;
+    }
+    ./run health || return 1
+    stage_bundle || return 1
+    staged="$state/source/output/Auto.app"
+    candidate=$(file_inode "$staged/Contents/MacOS/auto") || return 1
+    printf '%s\n' "$prior" > "$state/prior-inode" &&
+        printf '%s\n' "$candidate" > "$state/candidate-inode" || return 1
+    # Keep the prior signed image on the same filesystem, retaining its inode.
+    [[ "$(watcher_identity "$(watcher_pid "$target")" "$expected")" == "$token" ]] || {
+        fail "watcher changed during staging; no activation attempted"; return 1;
+    }
+    mv -fh "$bundle" "$state/prior.app" && mv -fh "$staged" "$bundle" || return 1
+    interrupt_watcher "$target" "$expected" "$pid" "$token" "$state/deploy-int" || return 1
+    await_image "$target" "$expected" "$candidate" 300 && ./run health
+}
+
+retire_rejected_watcher() {
+    local target=$1 expected=$2 prior=$3 candidate=$4 evidence=$5 pid token
+    pid=$(watcher_pid "$target") || pid=
+    if [[ -z "$pid" ]] || watcher_has_image "$pid" "$prior"; then
+        return 0
+    fi
+    # The prior watcher may still be draining after deployment timed out;
+    # never interrupt it again. Only the rejected image may be retired here.
+    [[ -n "$candidate" ]] && token=$(watcher_identity "$pid" "$expected") &&
+        watcher_has_image "$pid" "$candidate" || {
+        fail "cannot establish rejected watcher identity; no signal sent"; return 1;
+    }
+    [[ -f "$evidence" ]] || interrupt_watcher "$target" "$expected" "$pid" "$token" "$evidence"
+}
+
+restore_bundle() {
+    local prior candidate=
+    if [[ -d "$state/prior.app" ]]; then
+        if [[ -e "$bundle" ]]; then
+            [[ ! -e "$state/failed.app" ]] || { fail "ambiguous bundle recovery state"; return 1; }
+            mv -fh "$bundle" "$state/failed.app" || return 1
+        fi
+        mv -fh "$state/prior.app" "$bundle" || return 1
+    fi
+    prior=$(file_inode "$exe") || return 1
+    if [[ -f "$state/prior-inode" ]]; then
+        [[ "$prior" == "$(<"$state/prior-inode")" ]] || { fail "prior bundle identity changed"; return 1; }
+    fi
+    if [[ -f "$state/candidate-inode" ]]; then
+        candidate=$(<"$state/candidate-inode")
+    fi
+    retire_rejected_watcher "$target" "$expected" "$prior" "$candidate" "$state/rollback-int" || return 1
+    await_image "$target" "$expected" "$prior" 300 && ./run health
+}
+
+main() {
+    [[ $# == 3 && ( "$1" == deploy || "$1" == rollback ) ]] || { fail "expected deploy|rollback SHA STATE_DIR"; return 2; }
+    local mode=$1 sha=$2 state=$3 root target bundle exe expected gitdir
+    root=$(pwd -P) && gitdir=$(git rev-parse --absolute-git-dir) || return 1
+    [[ "$gitdir" == "$root/.git" && "$(git rev-parse HEAD)" == "$sha" && "$sha" =~ ^[0-9a-f]{40}$ ]] || {
+        fail "wrong canonical checkout or target SHA"; return 1;
+    }
+    [[ -d "$state" && "$state" == "$gitdir/greenline/"* && "$(cd "$state" && pwd -P)" == "$state" ]] || {
+        fail "missing private Greenline transaction state"; return 1;
+    }
+    [[ "$(/usr/bin/stat -f '%d' "$state")" == "$(/usr/bin/stat -f '%d' "$root/output")" ]] || {
+        fail "transaction state and Auto output must share a filesystem"; return 1;
+    }
+    target="gui/$(id -u)/com.darrenoakey.auto"
+    bundle="$root/output/Auto.app"
+    exe="$bundle/Contents/MacOS/auto"
+    expected="$exe watch"
+    case "$mode" in
+        deploy) activate_bundle ;;
+        rollback) restore_bundle ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
