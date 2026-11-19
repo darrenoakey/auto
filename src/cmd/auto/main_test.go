@@ -41,6 +41,68 @@ func TestRestartOverlapModesAreMutuallyExclusive(t *testing.T) {
 	}
 }
 
+func TestRestartModeCombinationsAreRejected(t *testing.T) {
+	manager := manager.New(t.TempDir())
+	for _, flags := range [][]string{
+		{"svc", "--overlap", "--term-only"},
+		{"svc", "--strict-overlap", "--term-only"},
+		{"svc", "--overlap", "--strict-overlap", "--term-only"},
+	} {
+		if code := dispatch(manager, "restart", flags); code != 1 {
+			t.Fatalf("dispatch(restart, %v) = %d, want 1", flags, code)
+		}
+	}
+}
+
+func TestRestartAcceptsTermOnlyFlag(t *testing.T) {
+	manager := manager.New(t.TempDir())
+	// Unknown process name exercises the term-only flag path through parse and
+	// dispatch and must reach the manager (exit 1 with the manager error), not
+	// the flag parser (which would also exit 1 with an unknown-flag error).
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	original := os.Stdout
+	os.Stdout = writer
+	code := dispatch(manager, "restart", []string{"svc", "--term-only"})
+	os.Stdout = original
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	output, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	if code != 1 {
+		t.Fatalf("dispatch returned %d, want 1", code)
+	}
+	if !strings.Contains(string(output), "unknown process") && !strings.Contains(string(output), "not found") && !strings.Contains(string(output), "Error") {
+		t.Fatalf("expected a manager (not parser) error, got: %q", output)
+	}
+}
+
+func TestUsageDocumentsTermOnly(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	original := os.Stdout
+	os.Stdout = writer
+	usage()
+	os.Stdout = original
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close usage writer: %v", err)
+	}
+	output, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read usage: %v", err)
+	}
+	if !strings.Contains(string(output), "--overlap|--strict-overlap|--term-only") {
+		t.Fatalf("usage missing term-only: %q", output)
+	}
+}
+
 func TestUsageDocumentsStrictOverlap(t *testing.T) {
 	reader, writer, err := os.Pipe()
 	if err != nil {

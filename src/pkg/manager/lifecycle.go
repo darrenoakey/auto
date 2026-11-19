@@ -229,6 +229,16 @@ func (m *Manager) recordStarted(name string, pid int, logPath string) {
 		p.ExplicitlyStopped = false
 		p.LogPath = logPath
 		p.StartingSince = nil // the pid is recorded; supervision may resume
+		// A newly recorded instance resolves any term-only hold: a successful
+		// replacement start ends an in-flight request, and for a timed-out hold
+		// this new start IS the operator's chosen recovery, so supervision of
+		// the new instance resumes with it. The epoch bump also invalidates any
+		// concurrent term-stop request aimed at the previous instance.
+		p.TermStopGeneration++
+		p.TermStopRequestedAt = nil
+		p.TermStopOriginalPid = nil
+		p.TermStopOriginalStartTime = nil
+		p.TermStopTimedOut = false
 	})
 }
 
@@ -360,9 +370,19 @@ func (m *Manager) clearRuntimeIdentity(name string) {
 
 // resetRuntimeIdentity removes runtime ownership from one process entry.
 func resetRuntimeIdentity(process *Process) {
+	// The ownership epoch bumps first: the next instance is a different one,
+	// and any stale term-stop request carrying the old epoch must not match it.
+	process.TermStopGeneration++
 	process.Pid = nil
 	process.StartTime = nil
 	process.StartingSince = nil
+	// A completed stop resolves any term-only hold: the hold exists to protect
+	// a live process from force kills, and there is no longer a live process
+	// recorded for this entry.
+	process.TermStopRequestedAt = nil
+	process.TermStopOriginalPid = nil
+	process.TermStopOriginalStartTime = nil
+	process.TermStopTimedOut = false
 }
 
 // clearExplicitStop clears the explicitly-stopped flag so the watch loop may

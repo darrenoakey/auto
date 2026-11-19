@@ -64,7 +64,7 @@ func dispatch(m *manager.Manager, command string, args []string) int {
 func dispatchNamed(m *manager.Manager, command string, args []string) int {
 	boolFlags := map[string]bool{}
 	if command == "restart" {
-		boolFlags = boolSet("overlap", "strict-overlap")
+		boolFlags = boolSet("overlap", "strict-overlap", "term-only")
 	}
 	return withArgs(args, nil, boolFlags, func(p *parsedArgs) int {
 		name, err := p.requireName()
@@ -77,10 +77,10 @@ func dispatchNamed(m *manager.Manager, command string, args []string) int {
 		case "stop":
 			return cmdStop(m, name)
 		case "restart":
-			if p.bools["overlap"] && p.bools["strict-overlap"] {
-				return failf("--overlap and --strict-overlap are mutually exclusive")
+			if countModes(p) > 1 {
+				return failf("--overlap, --strict-overlap and --term-only are mutually exclusive")
 			}
-			return cmdRestart(m, name, p.bools["overlap"], p.bools["strict-overlap"])
+			return cmdRestart(m, name, p.bools["overlap"], p.bools["strict-overlap"], p.bools["term-only"])
 		case "remove":
 			return cmdRemove(m, name)
 		default: // show, status
@@ -136,5 +136,16 @@ func toSet(names []string) map[string]bool {
 // usage prints the command summary.
 func usage() {
 	fmt.Println("Usage: auto [-q|--banner] <command> [args]")
-	fmt.Println("Commands: ps start stop restart [--overlap|--strict-overlap] add update remove show status log start-all stop-all restart-all watch shutdown install")
+	fmt.Println("Commands: ps start stop restart [--overlap|--strict-overlap|--term-only] add update remove show status log start-all stop-all restart-all watch shutdown install")
+}
+
+// countModes counts how many restart overlap/termination mode flags are set.
+func countModes(p *parsedArgs) int {
+	count := 0
+	for _, mode := range []string{"overlap", "strict-overlap", "term-only"} {
+		if p.bools[mode] {
+			count++
+		}
+	}
+	return count
 }

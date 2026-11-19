@@ -79,6 +79,7 @@ auto stop myapp
 auto restart myapp
 auto restart --overlap myapp
 auto restart --strict-overlap myapp
+auto restart --term-only myapp
 ```
 
 `restart --overlap` replaces a LIVE process with no connection-refused window
@@ -95,6 +96,28 @@ replacement cannot start. `--overlap` and `--strict-overlap` are mutually
 exclusive. Strict overlap preserves listener admission during a successful
 swap, but it is not a coordinated drain protocol: existing connections owned
 by the old process still close when that process terminates normally.
+
+`restart --term-only` asks the old process to terminate with `SIGTERM` and
+waits for it to exit on its own before starting the replacement, giving
+well-behaved services a chance to finish in-flight work and close their own
+listeners. The grace period is 20 seconds; if the process is still alive
+after it elapses, the restart fails without spawning the replacement or
+sending `SIGKILL`, and the old process is left untouched. Its supervision
+stays inhibited — durably, surviving watcher restarts — until an operator
+resolves the service (`auto stop <name>` then `auto start <name>`, or a
+manual start), because silently resuming would relaunch or SIGKILL a process
+that explicitly declined to terminate; a late natural exit of the old
+process is not resolution. The command fails closed unless the currently
+running watcher advertises term-only support, so an older watcher is never
+surprised by a grace period it cannot supervise around.
+
+Note on readiness: a graceful exit confirms termination, not readiness. The
+replacement's start does not wait for the service to accept connections, and
+for HTTP services the old PID keeps draining in-flight requests until it
+actually exits — so client-visible readiness during the swap depends on the
+service's own shutdown behavior and is not guaranteed by the grace window.
+`--term-only` will not delegate to launchd for isolated jobs. `--overlap`,
+`--strict-overlap`, and `--term-only` are mutually exclusive.
 
 ### View Process Details
 
@@ -289,7 +312,7 @@ auto ps
 | `ps` | List all processes with their status |
 | `start <name>` | Start a configured process |
 | `stop <name>` | Stop a running process |
-| `restart <name> [--overlap\|--strict-overlap]` | Stop and start a process; strict overlap fails without stopping the old live process (requires SO_REUSEPORT listener) |
+| `restart <name> [--overlap\|--strict-overlap\|--term-only]` | Stop and start a process; strict overlap fails without stopping the old live process (requires SO_REUSEPORT listener); term-only waits up to 20s for graceful self-exit before starting the replacement |
 | `add <name> <command> [--port PORT] [--workdir DIR] [--isolate on\|off]` | Add a new process and start it |
 | `update <name> [--port PORT] [--workdir DIR] [--isolate on\|off]` | Update process settings |
 | `remove <name>` | Stop and remove a process |

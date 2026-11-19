@@ -145,7 +145,11 @@ cmd_check() {
     echo ""
     cd "$SRC_DIR"
     echo "==> Running all tests..."
-    go test ./... -count=1 2>&1 | tee "$TEST_DIR/check.log"
+    {
+        go test ./... -count=1
+        echo "==> Running disposable macOS LaunchAgent integration..."
+        "$SCRIPT_DIR/tools/test-graceful-release-macos.sh"
+    } 2>&1 | tee "$TEST_DIR/check.log"
     echo "==> Quality gate PASSED. Safe to commit."
 }
 

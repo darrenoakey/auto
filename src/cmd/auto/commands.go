@@ -90,16 +90,23 @@ func cmdStop(m *manager.Manager, name string) int {
 // cmdRestart restarts a process. With overlap, the replacement spawns and
 // binds beside the running instance first (which must hold its listener with
 // SO_REUSEPORT), so the port never refuses connections during the swap.
-func cmdRestart(m *manager.Manager, name string, overlap, strictOverlap bool) int {
+// With term-only, the old process is asked to terminate with SIGTERM and gets
+// a grace period to exit on its own (default 20s) before the replacement
+// starts; on grace timeout the old process is left untouched and the restart
+// fails without spawning or killing anything.
+func cmdRestart(m *manager.Manager, name string, overlap, strictOverlap, termOnly bool) int {
 	var (
 		pid int
 		err error
 	)
-	if strictOverlap {
+	switch {
+	case strictOverlap:
 		pid, err = m.RestartProcessStrictOverlap(name)
-	} else if overlap {
+	case overlap:
 		pid, err = m.RestartProcessOverlap(name)
-	} else {
+	case termOnly:
+		pid, err = m.RestartProcessTermOnly(name)
+	default:
 		pid, err = m.RestartProcess(name)
 	}
 	if err != nil {
