@@ -78,8 +78,20 @@ func cmdStart(m *manager.Manager, name string) int {
 	return 0
 }
 
-// cmdStop stops a running process.
-func cmdStop(m *manager.Manager, name string) int {
+// cmdStop stops a running process. For the protected service, an attributed,
+// bounded maintenance lease is required and recorded before the stop signal.
+func cmdStop(m *manager.Manager, name string, p *parsedArgs) int {
+	if manager.IsProtected(name) {
+		req, err := maintenanceRequest(p, "stop")
+		if err != nil {
+			return failf("%v", err)
+		}
+		if err := m.StopProcessMaintenance(name, req); err != nil {
+			return failf("%v", err)
+		}
+		fmt.Printf("Stopped %s for %s (actor=%s reason=%s)\n", name, req.For, req.Actor, req.Reason)
+		return 0
+	}
 	if err := m.StopProcess(name, true); err != nil {
 		return failf("%v", err)
 	}
@@ -116,8 +128,20 @@ func cmdRestart(m *manager.Manager, name string, overlap, strictOverlap, termOnl
 	return 0
 }
 
-// cmdRemove removes a process from config.
-func cmdRemove(m *manager.Manager, name string) int {
+// cmdRemove removes a process from config. For the protected service, an
+// attributed, bounded maintenance lease is required and recorded before removal.
+func cmdRemove(m *manager.Manager, name string, p *parsedArgs) int {
+	if manager.IsProtected(name) {
+		req, err := maintenanceRequest(p, "remove")
+		if err != nil {
+			return failf("%v", err)
+		}
+		if err := m.RemoveProcessMaintenance(name, req); err != nil {
+			return failf("%v", err)
+		}
+		fmt.Printf("Removed %s (actor=%s reason=%s)\n", name, req.Actor, req.Reason)
+		return 0
+	}
 	if err := m.RemoveProcess(name); err != nil {
 		return failf("%v", err)
 	}

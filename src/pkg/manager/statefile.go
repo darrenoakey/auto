@@ -14,12 +14,20 @@ import (
 // nullability match the original Python state.json exactly so existing files
 // load unchanged.
 type Process struct {
-	Command                string   `json:"command,omitempty"`
-	Port                   *int     `json:"port,omitempty"`
-	Workdir                string   `json:"workdir,omitempty"`
-	Pid                    *int     `json:"pid,omitempty"`
-	StartTime              *string  `json:"start_time,omitempty"`
-	ExplicitlyStopped      bool     `json:"explicitly_stopped"`
+	Command           string  `json:"command,omitempty"`
+	Port              *int    `json:"port,omitempty"`
+	Workdir           string  `json:"workdir,omitempty"`
+	Pid               *int    `json:"pid,omitempty"`
+	StartTime         *string `json:"start_time,omitempty"`
+	ExplicitlyStopped bool    `json:"explicitly_stopped"`
+	// Maintenance is a bounded explicit-stop lease for the protected service.
+	// Legacy explicit stops without a lease are treated as unattended and healed.
+	Maintenance *Maintenance `json:"maintenance,omitempty"`
+	// LastLifecycle* is bounded, non-secret attribution for protected starts and
+	// restarts. It is diagnostic only and never authorizes a mutation.
+	LastLifecycleActor     string   `json:"last_lifecycle_actor,omitempty"`
+	LastLifecycleCommand   string   `json:"last_lifecycle_command,omitempty"`
+	LastLifecycleAt        *float64 `json:"last_lifecycle_at,omitempty"`
 	RestartAttempt         int      `json:"restart_attempt,omitempty"`
 	LastRestartTime        *float64 `json:"last_restart_time,omitempty"`
 	LogPath                string   `json:"log_path,omitempty"`

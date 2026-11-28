@@ -50,6 +50,35 @@ func (m *Manager) spawnWithRetry(name, command, workdir string, port *int) (int,
 			continue
 		}
 		if childStillRunning(pid) {
+			// The child survived the verify window, but it may still have
+			// failed its bind and be slow to exit. Poll the log briefly for
+			// a bind error before declaring success so a standing occupier
+			// is never mistaken for a healthy service.
+			logDeadline := time.Now().Add(500 * time.Millisecond)
+			for time.Now().Before(logDeadline) {
+				if logHasAddressInUse(logPath, offset) {
+					break
+				}
+				if !childStillRunning(pid) {
+					break
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			if logHasAddressInUse(logPath, offset) {
+				if port == nil {
+					return 0, "", fmt.Errorf(
+						"%s: bind failed with address already in use, but no port is configured for it, so auto cannot tell a momentary race from a standing occupier; refusing to retry. Register the service's port (auto update %s --port N) so the holder can be probed",
+						name, name)
+				}
+				if !isPortFree(*port) {
+					return 0, "", fmt.Errorf(
+						"%s: lost a race for its port: port %d is held by another process; auto never kills unmanaged port holders",
+						name, *port)
+				}
+				lastErr = fmt.Errorf("%s: lost a race for its port, retrying", name)
+				sleepSpawnBackoff(name, attempt)
+				continue
+			}
 			reapWhenDone(pid)
 			return pid, logPath, nil
 		}
@@ -169,7 +198,16 @@ func (m *Manager) spawnOnce(name, wrapped, workdir string) (int, string, int64, 
 		return 0, "", 0, err
 	}
 	pid := cmd.Process.Pid
-	time.Sleep(SpawnVerifyDelay)
+	// Wait for the child to either exit (fast failure) or survive the verify
+	// window. A single fixed sleep is racy: a slow interpreter may not have
+	// written its bind failure yet, causing a false success.
+	deadline := time.Now().Add(SpawnVerifyDelay)
+	for time.Now().Before(deadline) {
+		if !childStillRunning(pid) {
+			return pid, logPath, offset, nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	return pid, logPath, offset, nil
 }
 

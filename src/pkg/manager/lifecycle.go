@@ -3,6 +3,8 @@ package manager
 import (
 	"fmt"
 	"os"
+	"os/user"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -56,7 +58,11 @@ func (m *Manager) StartProcess(name string) (int, error) {
 	if daemonPid := m.liveDaemon(); daemonPid != 0 && daemonPid != os.Getpid() {
 		return m.delegateSpawnToDaemon(name)
 	}
-	return m.spawnDirect(name, def)
+	pid, err := m.spawnDirect(name, def)
+	if err == nil && isProtected(name) {
+		m.RecordLifecycleAttribution(name, lifecycleActor(), "start")
+	}
+	return pid, err
 }
 
 // spawnDirect performs the actual fork/exec in the calling process. Callers
@@ -227,6 +233,9 @@ func (m *Manager) recordStarted(name string, pid int, logPath string) {
 		p.Pid = &pid
 		p.StartTime = &st
 		p.ExplicitlyStopped = false
+		if !maintenanceLive(p.Maintenance, nowUnix()) {
+			p.Maintenance = nil
+		}
 		p.LogPath = logPath
 		p.StartingSince = nil // the pid is recorded; supervision may resume
 		// A newly recorded instance resolves any term-only hold: a successful
@@ -391,6 +400,16 @@ func (m *Manager) clearExplicitStop(name string) {
 	m.mutateProcess(name, func(p *Process) { p.ExplicitlyStopped = false })
 }
 
+func lifecycleActor() string {
+	if current, err := user.Current(); err == nil && current.Username != "" {
+		return current.Username
+	}
+	if name := os.Getenv("USER"); strings.TrimSpace(name) != "" {
+		return name
+	}
+	return fmt.Sprintf("pid-%d", os.Getpid())
+}
+
 // obliterateProcess kills a process with escalating force and verifies death.
 func (m *Manager) obliterateProcess(name string, pid int, markExplicit bool) error {
 	if err := m.StopProcess(name, markExplicit); err != nil {
@@ -428,6 +447,9 @@ func ensurePortFree(port *int, name string) error {
 func (m *Manager) RestartProcess(name string) (int, error) {
 	if err := m.checkStartsAllowed(); err != nil {
 		return 0, err
+	}
+	if isProtected(name) {
+		m.RecordLifecycleAttribution(name, lifecycleActor(), "restart")
 	}
 	def, ok := m.definition(name)
 	if !ok {
@@ -550,6 +572,9 @@ func (m *Manager) spawnReplacement(name string) (int, error) {
 func (m *Manager) RestartProcessOverlap(name string) (int, error) {
 	if err := m.checkStartsAllowed(); err != nil {
 		return 0, err
+	}
+	if isProtected(name) {
+		m.RecordLifecycleAttribution(name, lifecycleActor(), "restart --overlap")
 	}
 	def, ok := m.definition(name)
 	if !ok {

@@ -20,6 +20,7 @@ func (m *Manager) WatchTick() {
 	}
 	m.recordHeartbeat()
 	m.maybeArchiveOldLogs()
+	m.reportProtectedOutages()
 	restarts := 0
 	for _, name := range m.definedNames() {
 		if m.checkStartsAllowed() != nil {

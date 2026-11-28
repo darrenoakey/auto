@@ -63,10 +63,14 @@ func dispatch(m *manager.Manager, command string, args []string) int {
 // restart additionally accepts one overlap mode.
 func dispatchNamed(m *manager.Manager, command string, args []string) int {
 	boolFlags := map[string]bool{}
+	valueFlags := map[string]bool{}
 	if command == "restart" {
 		boolFlags = boolSet("overlap", "strict-overlap", "term-only")
 	}
-	return withArgs(args, nil, boolFlags, func(p *parsedArgs) int {
+	if command == "stop" || command == "remove" {
+		valueFlags = attributionFlags()
+	}
+	return withArgs(args, valueFlags, boolFlags, func(p *parsedArgs) int {
 		name, err := p.requireName()
 		if err != nil {
 			return failf("%v", err)
@@ -75,14 +79,14 @@ func dispatchNamed(m *manager.Manager, command string, args []string) int {
 		case "start":
 			return cmdStart(m, name)
 		case "stop":
-			return cmdStop(m, name)
+			return cmdStop(m, name, p)
 		case "restart":
 			if countModes(p) > 1 {
 				return failf("--overlap, --strict-overlap and --term-only are mutually exclusive")
 			}
 			return cmdRestart(m, name, p.bools["overlap"], p.bools["strict-overlap"], p.bools["term-only"])
 		case "remove":
-			return cmdRemove(m, name)
+			return cmdRemove(m, name, p)
 		default: // show, status
 			return cmdShow(m, name)
 		}
@@ -148,4 +152,24 @@ func countModes(p *parsedArgs) int {
 		}
 	}
 	return count
+}
+
+// attributionFlags returns the bounded attribution value flags for stop and remove.
+func attributionFlags() map[string]bool {
+	return valueSet("actor", "reason", "for")
+}
+
+// maintenanceRequest builds a bounded StopRequest from parsed attribution flags.
+func maintenanceRequest(p *parsedArgs, command string) (manager.StopRequest, error) {
+	actor, _ := p.values["actor"]
+	reason, _ := p.values["reason"]
+	forValue, _ := p.values["for"]
+	if actor == "" || reason == "" || forValue == "" {
+		return manager.StopRequest{}, fmt.Errorf("protected stop requires --actor, --reason, and --for (1m-2h)")
+	}
+	d, err := manager.ParseMaintenanceDuration(forValue)
+	if err != nil {
+		return manager.StopRequest{}, err
+	}
+	return manager.StopRequest{Actor: actor, Reason: reason, For: d, Command: command}, nil
 }
